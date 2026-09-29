@@ -3,6 +3,7 @@
 import { access, stat } from "node:fs/promises";
 import { paths } from "../lib/paths.js";
 import { findGo, hasGoSource, readBuildInfo, sourceFingerprint } from "../bridge/build.js";
+import { collectReadiness } from "../bridge/collector.js";
 import { health as bridgeHealth, listBridgeModels, readLogTail, readPid } from "../bridge/bridge.js";
 import { createGlmProvider } from "../providers/glm.js";
 import { loadSecrets, maskSecret } from "../config/index.js";
@@ -122,8 +123,25 @@ export async function runDiagnostics({ config, deep = false }) {
         : live.tokenCount === 0
           ? "pool empty — every request needs one for its Aliyun captcha"
           : "the bridge did not report a token count",
-      live.tokenCount > 0 ? undefined : "`zeke tokens collect` harvests a batch (drives a real browser; needs Playwright's chromium)",
+      live.tokenCount > 0 ? undefined : "`zeke tokens collect` harvests a batch — it drives a real browser and installs Chromium on first run",
     );
+
+    // An empty pool is a failure above, but the useful next question is
+    // whether harvesting can even run — that decides between "just collect"
+    // and "install Go / install the browser libraries first".
+    if (live.tokenCount <= 0) {
+      const harvest = await collectReadiness();
+      push(
+        "harvest path",
+        harvest.ready ? "warn" : "fail",
+        harvest.ready
+          ? `${harvest.collector.exists ? "collector built" : "collector will be built on demand"}; ${harvest.browsers.any ? "Playwright browsers cached" : "browsers download on first run"}`
+          : harvest.blockers.map((b) => b.message).join("; "),
+        harvest.ready
+          ? "`zeke tokens collect` harvests a batch (`zeke tokens collect --dry-run` to inspect first)"
+          : harvest.blockers.map((b) => b.fix).join("; "),
+      );
+    }
 
     const waf = live.status?.waf;
     if (waf) {

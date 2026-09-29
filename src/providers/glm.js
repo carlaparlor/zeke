@@ -40,7 +40,7 @@ const CAPTCHA_FAILURE = /captcha|device tokens? (remaining|available)|token retr
 
 /** The one command that refills the pool. */
 export const DEVICE_TOKEN_REMEDY =
-  "each request spends a harvested device token on its Aliyun captcha — refill the pool with `zeke tokens collect` (needs Playwright's chromium)";
+  "each request spends a harvested device token on its Aliyun captcha — refill the pool with `zeke tokens collect`";
 
 /**
  * Turn a completion failure into the action that fixes it. Returns "" when the

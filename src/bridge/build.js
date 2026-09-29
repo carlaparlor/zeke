@@ -253,7 +253,8 @@ export async function buildBridge(options = {}) {
     });
     steps.push({ name: "go build token-collector", code: collectorBuild.code });
     if (collectorBuild.code !== 0) {
-      // The collector needs Playwright browsers; treat a failure as optional.
+      // The collector needs a Go toolchain (it installs its own Playwright driver
+      // and Chromium at run time); treat a build failure as optional.
       log(`token-collector build failed (optional): ${collectorBuild.stderr.trim().split("\n")[0]}`);
       collector = undefined;
     } else {

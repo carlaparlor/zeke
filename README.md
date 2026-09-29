@@ -83,10 +83,15 @@ zeke tokens status               # how many are left
 zeke tokens swap ./tokens.sqlite # hot-swap a pool you harvested elsewhere
 ```
 
-`collect` builds `token-collector` from the vendored source on demand and needs Playwright's
-chromium (`npx playwright install chromium`). Tokens are consumed FIFO and deleted after use, so
-a busy session drains the pool and refills it the same way. Hot-swap posts to the bridge's
+`collect` builds `token-collector` from the vendored source on demand, runs it from `$ZEKE_HOME`
+(the collector writes `./tokens.sqlite` into its working directory — there is no `--db-path` flag
+upstream), and hot-swaps the result in. The collector downloads its own Playwright driver and
+Chromium on first run (~150 MB, needs network); on Linux the browser also needs system libraries,
+which `npx playwright install-deps chromium` installs. Tokens are consumed FIFO and deleted after
+use, so a busy session drains the pool and refills it the same way. Hot-swap posts to the bridge's
 `/sqlite` endpoint, so a drained pool can be refilled mid-session without losing context.
+
+`zeke tokens collect --dry-run` prints what harvesting needs before anything runs.
 
 **A personal JWT — optional, recommended.** `chat.z.ai` → DevTools → Local Storage → key
 `token`:
@@ -305,7 +310,7 @@ breaker's `503` + `Retry-After` backoff.
 ## Tests
 
 ```sh
-npm test          # 344 tests in 10 files
+npm test          # 356 tests in 11 files
 npm run selftest  # end-to-end: real CLI against a mock bridge
 zeke selftest     # same suite, from an installed checkout
 ```
@@ -341,6 +346,17 @@ zeke tokens status    # how many are left afterwards
 ```
 
 A `ZAI_TOKEN` does not change this; the captcha is per request regardless.
+
+**`zeke tokens collect` finishes and the pool is still empty.** The collector writes
+`./tokens.sqlite` in its working directory and takes no `--db-path` flag, so it must run from
+`$ZEKE_HOME` — zeke does that for you, and reports the path it harvested into. If it stopped
+early, the browser is the usual cause: run it once with `--no-tui` to see the error, and install
+the system libraries with `npx playwright install-deps chromium`.
+
+**Harvesting fails before it starts.** `zeke tokens collect --dry-run` shows the whole path:
+whether the collector is built (it is built on demand from `vendor/glm-free-api`), whether the
+vendored source and a Go toolchain are there to build it with, whether the Playwright browser
+cache exists, and anything that will be downloaded on first run.
 
 **A reply comes back empty — no text, no tool call, no error.** Upstream failures reach
 streaming clients *inside* the 200 stream (`data: {"error": …}` + `[DONE]`), because the

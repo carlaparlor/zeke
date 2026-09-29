@@ -12,6 +12,7 @@ import path from "node:path";
 import { paths } from "../lib/paths.js";
 import { maskSecret, saveSecrets } from "../config/index.js";
 import { buildBridge, ensureVendored, findGo, sourceFingerprint, writeBuildInfo, UPSTREAM_REPO } from "../bridge/build.js";
+import { collectReadiness, harvestTokens } from "../bridge/collector.js";
 import { bridgeBaseUrl, health as bridgeHealth, startBridge, stopBridge, swapTokenDb } from "../bridge/bridge.js";
 import { createGlmProvider, GLM_MODEL_PRESETS } from "../providers/glm.js";
 import { style } from "../ui/ansi.js";
@@ -143,22 +144,25 @@ export async function setupCommand({ flags, config }) {
 
   // ------------------------------------------------------------- 5. start
   step(5, "Start the bridge");
+  // Built here rather than inside the branch: step 6 reuses it to hot-swap a
+  // freshly harvested pool without a restart.
+  const bridgeConfig = {
+    host: config.bridge.host,
+    port: config.bridge.port,
+    authToken,
+    agentMode: config.bridge.agentMode !== false,
+    sessionPoolSize: config.bridge.sessionPoolSize,
+    sessionReuseCount: config.bridge.sessionReuseCount,
+    zaiToken: zaiToken ?? undefined,
+    tokenDb: paths.tokenDb(),
+    binary: binary ?? config.bridge.binary,
+  };
+
   if (flags["no-start"]) {
     warn("not starting (--no-start)");
   } else if (!binary && !config.bridge.binary) {
     warn("nothing to start — the bridge was not built");
   } else {
-    const bridgeConfig = {
-      host: config.bridge.host,
-      port: config.bridge.port,
-      authToken,
-      agentMode: config.bridge.agentMode !== false,
-      sessionPoolSize: config.bridge.sessionPoolSize,
-      sessionReuseCount: config.bridge.sessionReuseCount,
-      zaiToken: zaiToken ?? undefined,
-      tokenDb: paths.tokenDb(),
-      binary: binary ?? config.bridge.binary,
-    };
 
     const before = await bridgeHealth(bridgeConfig);
     if (before.listening) {
@@ -180,7 +184,7 @@ export async function setupCommand({ flags, config }) {
         ok(`${live.tokenCount} device tokens in the pool`);
       } else if (live.tokenCount === 0) {
         warn("the device-token pool is empty — every request needs one for its Aliyun captcha");
-        log(paint.dim("  `zeke tokens collect` harvests a batch (needs Playwright's chromium)"));
+        log(paint.dim("  `zeke tokens collect` harvests a batch"));
         summary.needsTokens = true;
       }
     } catch (err) {
@@ -220,6 +224,38 @@ export async function setupCommand({ flags, config }) {
       log(paint.dim("  no device tokens in the pool — `zeke tokens collect` harvests a batch"));
     }
     log(paint.dim("  skipping the tool-call probe until a completion works"));
+
+    // Offer to close the loop right here: an empty pool is the single most
+    // common reason a fresh install cannot answer, and everything needed to
+    // fix it is already in place.
+    if (summary.needsTokens && !flags["no-harvest"] && process.stdin.isTTY) {
+      const harvest = await collectReadiness();
+      if (!harvest.ready) {
+        warn("harvesting is not possible yet:");
+        for (const blocker of harvest.blockers) log(paint.dim(`    ${blocker.message} → ${blocker.fix}`));
+      } else if (await askYesNo("  harvest device tokens now? [Y/n] ", true)) {
+        log(paint.dim("  running the collector — it drives a real browser and installs Chromium on first run"));
+        const result = await harvestTokens({ flags, config: bridgeConfig, log: (line) => log(paint.dim(`    ${line}`)) });
+        if (result.code === 0 && result.harvested && result.swapped && result.tokenCount > 0) {
+          ok(`harvested and hot-swapped — ${result.tokenCount} device tokens`);
+          summary.needsTokens = false;
+          const retry = await provider.probe();
+          if (retry.ok) {
+            ok(retry.detail.replace(/ — .*$/, ""));
+            const toolProbe = await provider.probeToolCalling();
+            if (toolProbe.ok) {
+              ok(toolProbe.detail);
+              summary.ok = true;
+            }
+          } else {
+            fail(retry.detail);
+          }
+        } else {
+          fail(`harvesting did not produce a usable pool${result.swapError ? ` (${result.swapError})` : ""}`);
+          log(paint.dim("  if the browser failed to launch: `npx playwright install-deps chromium`"));
+        }
+      }
+    }
   } else {
     const toolProbe = await provider.probeToolCalling();
     if (toolProbe.ok) ok(toolProbe.detail);
@@ -296,6 +332,28 @@ export async function saveConfig(patch, flags = {}) {
   await writeFile(paths.config(), `${JSON.stringify(next, null, 2)}\n`, "utf8");
   if (!flags.quiet) process.stdout.write(`  ${style.green("✓")} wrote ${paths.config()}\n`);
   return next;
+}
+
+/**
+ * A y/N prompt. Defaults safely when stdin is not a terminal, so `setup` in CI
+ * never blocks waiting for an answer.
+ */
+async function askYesNo(label, fallback = false) {
+  if (!process.stdin.isTTY) return fallback;
+  const answer = (await promptLabel(label)).trim().toLowerCase();
+  if (!answer) return true;
+  return answer === "y" || answer === "yes";
+}
+
+function promptLabel(label) {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    rl.question(label, (answer) => {
+      rl.close();
+      resolve(answer);
+    });
+    rl.on("close", () => resolve(""));
+  });
 }
 
 function ask(label, { silent } = {}) {

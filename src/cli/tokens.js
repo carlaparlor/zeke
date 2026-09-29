@@ -8,11 +8,11 @@
 // and image input. Both end with the running bridge picking the change up
 // without a restart.
 
-import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { paths } from "../lib/paths.js";
 import { saveSecrets, maskSecret } from "../config/index.js";
 import { buildBridge } from "../bridge/build.js";
+import { collectReadiness, harvestTokens } from "../bridge/collector.js";
 import { health as bridgeHealth, swapTokenDb } from "../bridge/bridge.js";
 import { bridgeConfigFrom } from "./bridge-cli.js";
 import { style } from "../ui/ansi.js";
@@ -91,50 +91,89 @@ export async function tokensCommand({ flags, positional, config }) {
   }
 
   if (action === "collect") {
-    const collector = paths.collectorBinary();
-    if (!(await fileExists(collector))) {
+    if (flags["dry-run"]) {
+      const readiness = await collectReadiness();
+      out(paint.bold("harvesting prerequisites"));
+      out(`  collector    ${readiness.collector.exists ? paint.green(readiness.collector.path) : paint.yellow(`not built (${readiness.collector.path})`)}`);
+      out(`  source       ${readiness.source ? paint.green(paths.vendoredBridge()) : paint.red("missing")}`);
+      out(`  go           ${readiness.go ? paint.green(`${readiness.go.go} (${readiness.go.origin})`) : paint.yellow("not found")}`);
+      out(`  browsers     ${readiness.browsers.any ? paint.green(readiness.browsers.dirs.join(", ")) : paint.yellow("not cached — the collector downloads them on first run")}`);
+      for (const note of readiness.notes) out(paint.dim(`  note: ${note}`));
+      for (const blocker of readiness.blockers) {
+        out(paint.red(`  blocker: ${blocker.message}`));
+        out(paint.dim(`    ↳ ${blocker.fix}`));
+      }
+      return readiness.ready ? 0 : 1;
+    }
+
+    if (!(await fileExists(paths.collectorBinary()))) {
       // The collector is only ever built as part of `zeke setup`, and setup
       // skips the build when a bridge binary is already configured — so the
       // one command that fixes an empty pool could not build what it needed.
       // Build it here instead, from the same vendored source.
+      const readiness = await collectReadiness();
+      if (!readiness.ready) {
+        out(`${paint.red("✗")} the token collector cannot be built`);
+        for (const blocker of readiness.blockers) {
+          out(`  ${blocker.message}`);
+          out(paint.dim(`  ↳ ${blocker.fix}`));
+        }
+        return 1;
+      }
       out(paint.dim(`collector not built — building it from ${paths.vendoredBridge()}`));
       try {
         const built = await buildBridge({ collector: true, log: (m) => out(paint.dim(`  ${m}`)) });
         if (!built.collector) throw new Error("the Go build did not produce a token-collector binary");
         out(`${paint.green("✓")} built ${built.collector}`);
       } catch (err) {
-        out(`${paint.red("✗")} token-collector not built (${collector}) — ${err.message}`);
+        out(`${paint.red("✗")} token-collector not built (${paths.collectorBinary()}) — ${err.message}`);
         out(paint.dim("  build it with `zeke setup` (it needs Go and the vendored source)"));
-        out(paint.dim("  harvesting also needs Playwright browsers: npx playwright install chromium"));
         return 1;
       }
     }
 
-    const args = [];
-    if (flags.tokens) args.push("--tokens", String(flags.tokens));
-    if (flags.batch) args.push("--batch", String(flags.batch));
-    if (flags.parallel) args.push("--parallel", String(flags.parallel));
-    if (flags.headed) args.push("--headed");
-    if (flags["no-tui"]) args.push("--no-tui");
-    if (flags.unsafe) args.push("--unsafe");
-
-    out(paint.dim(`running ${collector} ${args.join(" ")}`));
-    out(paint.dim("this drives a real browser against chat.z.ai; it needs Playwright's chromium installed"));
+    out(paint.dim("this drives a real browser against chat.z.ai and mints device tokens into the pool"));
+    out(paint.dim("the collector installs its own Playwright driver + Chromium on first run (~150 MB)"));
     out("");
 
-    const code = await runInteractive(collector, args, { dbPath: paths.tokenDb() });
-    if (code !== 0) {
-      out(`${paint.red("✗")} collector exited with ${code}`);
-      return code;
+    // The collector writes ./tokens.sqlite in its cwd, so harvestTokens runs it
+    // from $ZEKE_HOME — the path the bridge was started with.
+    const result = await harvestTokens({
+      flags,
+      config: bridgeConfig,
+      log: (line) => out(paint.dim(`  ${line}`)),
+    });
+
+    out("");
+    if (!result.ran) {
+      out(`${paint.red("✗")} harvesting could not start`);
+      for (const blocker of result.readiness.blockers) {
+        out(`  ${blocker.message}`);
+        out(paint.dim(`  ↳ ${blocker.fix}`));
+      }
+      return 1;
+    }
+    if (result.code !== 0) {
+      out(`${paint.red("✗")} collector exited with ${result.code}`);
+      out(paint.dim("  if it failed launching a browser, install the system libraries: `npx playwright install-deps chromium`"));
+      out(paint.dim("  and re-run with --no-tui if the TUI swallowed the error"));
+      return result.code;
+    }
+    if (!result.harvested) {
+      out(`${paint.yellow("!")} the collector finished but wrote nothing to ${result.dbPath}`);
+      return 1;
     }
 
-    out("");
-    try {
-      const result = await swapTokenDb(paths.tokenDb(), bridgeConfig);
-      out(`${paint.green("✓")} hot-swapped into the running bridge — ${result.token_count} tokens`);
-    } catch (err) {
-      out(paint.yellow(`! harvested, but the bridge did not take the swap: ${err.message}`));
-      out(paint.dim("  start the bridge first (`zeke bridge start`), then `zeke tokens swap`"));
+    out(`${paint.green("✓")} harvested into ${result.dbPath}`);
+    if (result.swapped) {
+      out(`${paint.green("✓")} hot-swapped into the running bridge — ${result.tokenCount} tokens`);
+      if (result.tokenCount <= 0) {
+        out(paint.red("  the bridge reports an empty pool: the harvested file has no usable tokens"));
+        return 1;
+      }
+    } else {
+      out(`${paint.yellow("!")} the bridge did not take the swap: ${result.swapError}`);
+      out(paint.dim("  start it (`zeke bridge start`) and re-run `zeke tokens swap` — the pool is saved either way"));
     }
     return 0;
   }
@@ -158,20 +197,6 @@ async function describeDb(file) {
   } catch {
     return `${file} ${style.dim("(not created yet)")}`;
   }
-}
-
-function runInteractive(command, args, { dbPath }) {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, {
-      stdio: "inherit",
-      env: { ...process.env, DB_PATH: dbPath },
-    });
-    child.on("error", (err) => {
-      process.stdout.write(`${err.message}\n`);
-      resolve(127);
-    });
-    child.on("close", (code) => resolve(code ?? 0));
-  });
 }
 
 function plain() {
