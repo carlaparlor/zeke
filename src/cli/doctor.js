@@ -111,11 +111,18 @@ export async function runDiagnostics({ config, deep = false }) {
       live.healthy ? "initialised" : "not initialised — chat.z.ai has not accepted a session",
       live.healthy ? undefined : "check `zeke tokens status`, then `zeke bridge restart`; see `zeke bridge logs`",
     );
+    // Not optional, and not replaced by a Z.AI token: the bridge mints one
+    // Aliyun captcha per request (captcha.go) and every one of them consumes a
+    // harvested device token. A ZAI_TOKEN only picks the session identity.
     push(
       "device tokens",
-      live.tokenCount > 0 ? "ok" : config.hasZaiToken ? "ok" : "warn",
-      live.tokenCount > 0 ? `${live.tokenCount} in the pool` : config.hasZaiToken ? "not needed (using a Z.AI token)" : "pool empty",
-      live.tokenCount > 0 || config.hasZaiToken ? undefined : "`zeke tokens collect`",
+      live.tokenCount > 0 ? "ok" : live.tokenCount === 0 ? "fail" : "warn",
+      live.tokenCount > 0
+        ? `${live.tokenCount} in the pool`
+        : live.tokenCount === 0
+          ? "pool empty — every request needs one for its Aliyun captcha"
+          : "the bridge did not report a token count",
+      live.tokenCount > 0 ? undefined : "`zeke tokens collect` harvests a batch (drives a real browser; needs Playwright's chromium)",
     );
 
     const waf = live.status?.waf;

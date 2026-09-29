@@ -95,6 +95,26 @@ export function isDoneMarker(event) {
 }
 
 /**
+ * The bridge reports an upstream failure *inside* an HTTP 200 stream:
+ * `data: {"error":{"message":…,"type":"api_error","code":500}}` followed by
+ * `data: [DONE]` (handlers.go, streaming branch — the non-streaming branch
+ * uses a real 4xx/5xx status instead). A client that only looks at `choices`
+ * sees an empty, successful reply: no text, no tool call, no error. That is
+ * how "captcha generation returned empty payload" turns into "the model
+ * answered nothing".
+ *
+ * @param {any} json parsed `data:` payload
+ * @returns {{message?: string, type?: string, code?: string|number}|null} the error payload, or null
+ */
+export function inlineErrorOf(json) {
+  if (!json || typeof json !== "object" || Array.isArray(json)) return null;
+  const error = json.error;
+  if (!error) return null;
+  if (typeof error === "object") return Array.isArray(error) ? null : error;
+  return { message: String(error) };
+}
+
+/**
  * Accumulate OpenAI chat-completion stream deltas into one assistant message.
  *
  * Tool calls arrive as fragments keyed by `index`; GLM's agent-mode shim

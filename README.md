@@ -26,25 +26,40 @@ zeke assumes you run the bridge yourself, with your own tokens, and it manages t
 you: building it, starting it with the right flags, harvesting device tokens, hot-swapping them
 without a restart, and diagnosing the whole chain when something is off.
 
+One thing about that chain is easy to miss, and zeke goes out of its way to say it loudly: the
+bridge signs **every** request with an Aliyun `captcha_verify_param`, and each captcha spends one
+harvested device token. A `ZAI_TOKEN` JWT does *not* remove that requirement — it only decides
+which identity and which models the session gets. An empty device-token pool therefore means
+nothing completes at all, with the bridge still reporting itself `healthy`.
+
 ---
 
 ## Install
 
 ```sh
 git clone <this repo> && cd zeke
-zeke setup        # or: node bin/zeke.mjs setup
+node bin/zeke.mjs setup   # no install step: zeke is the checkout
+npm link                  # optional, so plain `zeke setup` works anywhere
 ```
+
+If `zeke` on your `PATH` is something else (a Python package, another tool), the
+shell reports that instead — run `node bin/zeke.mjs …` from the checkout, or link
+it with `npm link`.
 
 `zeke setup` does six things and tells you what it is doing at each step:
 
 1. checks Node ≥ 20.11
 2. vendors the GLM-Free-API source into `vendor/glm-free-api/` (from the committed zip)
-3. fetches a Go toolchain if you do not have one, then builds `zai-api` into `$ZEKE_HOME/bin`
-4. configures credentials — a `ZAI_TOKEN` JWT, a harvested device-token pool, or neither
+3. builds `zai-api` into `$ZEKE_HOME/bin` with the Go toolchain on your `PATH` (or one you
+   dropped in `$ZEKE_HOME/go`) — no Go means a clear error and a `bridge.binary` escape hatch
+4. configures credentials — the bridge `AUTH_TOKEN`, an optional `ZAI_TOKEN` JWT, and a check
+   for the device-token pool every request needs
 5. starts the bridge with agent mode on
 6. verifies end to end: `/health`, a real completion, then a tool call
 
-Nothing in that chain is hidden. If a step fails, the message says which one and what to run.
+Nothing in that chain is hidden. If a step fails, the message says which one and what to run —
+and a completion that fails because the device-token pool is empty says exactly that, rather than
+pointing at agent mode or the model.
 
 **Runtime dependencies: zero.** `package.json` has an empty `dependencies` block. Tests use
 `node:test`.
@@ -53,30 +68,37 @@ Nothing in that chain is hidden. If a step fails, the message says which one and
 
 ## Tokens
 
-The hosted site does not work, so zeke is built around tokens you control. Two kinds, and you
-can use either or both:
+The hosted site does not work, so zeke is built around tokens you control. There are two kinds,
+and they are not interchangeable — one is required, the other is an upgrade:
 
-**A personal JWT** — `chat.z.ai` → DevTools → Local Storage → key `token`:
-
-```sh
-zeke setup --token <jwt>
-```
-
-A JWT unlocks every model, including the vision models. Without one you are a guest, and
-guests get only `glm-5.3-flash` and `glm-4.7`. That is enough to work; zeke defaults to
-`glm-4.7` precisely so a tokenless install still functions.
-
-**Harvested device tokens** — the collector drives real browsers to mint session tokens into a
-SQLite pool the bridge rotates through:
+**Harvested device tokens — required.** The bridge mints an Aliyun `captcha_verify_param` for
+every completion, and each captcha consumes one device token from the pool. Nothing completes
+while that pool is empty, whatever else is configured: zeke's own probe on a fresh install
+reports `healthy, no device tokens but completion failed — server_error: captcha generation
+returned empty payload`. The collector drives real browsers to mint tokens into a SQLite pool:
 
 ```sh
-zeke tokens collect              # harvest into $ZEKE_HOME/tokens.sqlite
+zeke tokens collect              # build the collector if needed, harvest, hot-swap
 zeke tokens status               # how many are left
-zeke tokens swap ./tokens.sqlite # hot-swap without restarting the bridge
+zeke tokens swap ./tokens.sqlite # hot-swap a pool you harvested elsewhere
 ```
 
-Hot-swap posts to the bridge's `/sqlite` endpoint, so a drained pool can be refilled mid-session
-without losing context.
+`collect` builds `token-collector` from the vendored source on demand and needs Playwright's
+chromium (`npx playwright install chromium`). Tokens are consumed FIFO and deleted after use, so
+a busy session drains the pool and refills it the same way. Hot-swap posts to the bridge's
+`/sqlite` endpoint, so a drained pool can be refilled mid-session without losing context.
+
+**A personal JWT — optional, recommended.** `chat.z.ai` → DevTools → Local Storage → key
+`token`:
+
+```sh
+zeke setup --token <jwt>          # or later: zeke tokens token <jwt>
+```
+
+A JWT unlocks every model, including the vision models. Without one you are a guest, and guests
+get only `glm-5.3-flash` and `glm-4.7`. It does **not** replace the device-token pool: the
+captcha is minted per request either way, so zeke defaults to `glm-4.7` for guest sessions and
+still expects a harvested pool behind it.
 
 ---
 
@@ -159,9 +181,15 @@ The bridge's `/status` endpoint does **not** report whether agent mode is on —
 are being ignored" is invisible from the outside. `zeke doctor` works around that by probing
 for real:
 
-1. `GET /health` — is anything listening?
-2. a trivial completion — do auth and the z.ai session work?
+1. `GET /health` — is anything listening? (and how many device tokens are left in the pool?)
+2. a trivial completion — do auth, the z.ai session and the captcha path work?
 3. **a single tool call** — is agent mode actually on?
+
+A `healthy` bridge with an empty device-token pool is reported as a *failure*, not a warning, because it
+cannot answer anything: the captcha has nothing left to spend. The tool probe is skipped when the
+completion probe already failed — running it on a dead bridge used to end in a misleading
+`--agent-mode` verdict, and the streaming errors that caused that are now surfaced instead (the
+bridge reports upstream failures inside a 200 stream as `data: {"error": …}`; zeke reads them).
 
 `zeke doctor --json` prints a machine-readable report and nothing else, for CI. A bridge zeke
 did not build is reported as a warning, not a failure: pointing at someone else's instance is
@@ -186,9 +214,11 @@ defaults, then a project `.zeke/config.json`, then environment variables.
 
 | Profile | Model | Notes |
 |---|---|---|
-| `default` | `glm-4.7` | works without a token |
+| `default` | `glm-4.7` | works as a guest — no Z.AI token |
 | `fast` | `glm-5.3-flash` | cheap, quick |
 | `deep` | `glm-5.3` | thinking on, `high` effort, 16k output |
+
+(Guest models need no *Z.AI* token. Every model still needs the device-token pool above.)
 
 Environment: `ZEKE_BASE_URL`, `ZEKE_AUTH_TOKEN`, `ZEKE_MODEL`, `ZEKE_HOME`, `ZAI_TOKEN`,
 `NO_COLOR`. `ZEKE_BASE_URL` also drives where bridge-management commands look, so pointing at a
@@ -275,7 +305,7 @@ breaker's `503` + `Retry-After` backoff.
 ## Tests
 
 ```sh
-npm test          # 335 tests in 10 files
+npm test          # 344 tests in 10 files
 npm run selftest  # end-to-end: real CLI against a mock bridge
 zeke selftest     # same suite, from an installed checkout
 ```
@@ -283,7 +313,10 @@ zeke selftest     # same suite, from an installed checkout
 The suite uses `node:test` and needs no network. Integration tests run the real CLI as a
 subprocess against `src/mock-bridge/server.js`, which speaks the bridge's protocol including
 streamed tool-call argument fragments — so the SSE client, the tool-call parser and the JSON
-repair path are all exercised for real.
+repair path are all exercised for real. The mock also reproduces the bridge's *streaming-branch
+failure shape* (HTTP 200 + `data: {"error": …}` + `[DONE]`) and its empty-pool captcha failure,
+which is how `zeke setup` and `zeke doctor` are tested against the exact confusion this repo was
+born from.
 
 Two things are honestly **not** covered, because this sandbox cannot reach them:
 
@@ -293,6 +326,31 @@ Two things are honestly **not** covered, because this sandbox cannot reach them:
   one. `buildBridge` is tested against a stub `go` on PATH — the same code runs, the same
   arguments are passed, the same failures surface — but that proves zeke's orchestration, not
   that upstream compiles. Run `zeke setup` on a machine with Go to close that gap.
+
+---
+
+## Troubleshooting
+
+**`health` says `healthy` but every completion fails with
+`server_error: captcha generation returned empty payload`.** The device-token pool is empty —
+the bridge had nothing to mint the request's captcha from. Fill it:
+
+```sh
+zeke tokens collect   # builds the collector when missing, harvests, hot-swaps
+zeke tokens status    # how many are left afterwards
+```
+
+A `ZAI_TOKEN` does not change this; the captcha is per request regardless.
+
+**A reply comes back empty — no text, no tool call, no error.** Upstream failures reach
+streaming clients *inside* the 200 stream (`data: {"error": …}` + `[DONE]`), because the
+bridge has already committed its headers. zeke reads those payloads and turns them into real
+errors; if you are on an older build, `zeke bridge logs` shows what the bridge actually said.
+
+**Doctor blames agent mode.** It does not any more: the tool-call probe only runs when a
+completion works and is only read as "agent mode is off" when the model answered in prose.
+Restart the bridge with `zeke bridge restart` if it really was started without it — zeke passes
+`AGENT_MODE=true` itself.
 
 ---
 

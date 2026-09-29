@@ -118,15 +118,20 @@ export async function setupCommand({ flags, config }) {
     ok(`Z.AI token ${maskSecret(zaiToken)}${flags.token ? " (from --token)" : " (already configured)"}`);
   } else if (flags["no-token"]) {
     warn("skipping — the bridge will run as a guest (only glm-5.3-flash and glm-4.7, no image input)");
+    log(paint.dim("  a Z.AI token is optional; device tokens are not — one is spent per request's captcha"));
   } else if (process.stdin.isTTY) {
     log(paint.dim("  A Z.AI token unlocks every model and image input. Get it from chat.z.ai:"));
     log(paint.dim("    DevTools → Application → Local Storage → https://chat.z.ai → key `token`"));
     log(paint.dim("  (press enter to skip and run as a guest)"));
     const answer = await ask("  token", { silent: true });
     if (answer.trim()) zaiToken = answer.trim();
-    else warn("no token — guest mode");
+    else {
+      warn("no token — guest mode");
+      log(paint.dim("  a Z.AI token is optional; device tokens are not — one is spent per request's captcha"));
+    }
   } else {
     warn("not interactive — skipping the token prompt (pass --token <jwt> to set one)");
+    log(paint.dim("  a Z.AI token is optional; device tokens are not — one is spent per request's captcha"));
   }
 
   const authToken = flags["auth-token"] ?? config.bridge.authToken ?? randomToken();
@@ -166,6 +171,18 @@ export async function setupCommand({ flags, config }) {
       ok(`listening on ${started.url} (pid ${started.pid})`);
       ok(`log ${started.logFile}`);
       summary.url = started.url;
+
+      // The other credential, and the one people miss: the bridge mints an
+      // Aliyun captcha for every completion from the harvested pool, so an
+      // empty pool means no completion at all — JWT or not.
+      const live = await bridgeHealth(bridgeConfig);
+      if (live.tokenCount > 0) {
+        ok(`${live.tokenCount} device tokens in the pool`);
+      } else if (live.tokenCount === 0) {
+        warn("the device-token pool is empty — every request needs one for its Aliyun captcha");
+        log(paint.dim("  `zeke tokens collect` harvests a batch (needs Playwright's chromium)"));
+        summary.needsTokens = true;
+      }
     } catch (err) {
       fail(err.message);
       summary.ok = false;
@@ -190,15 +207,30 @@ export async function setupCommand({ flags, config }) {
     summary.ok = false;
   }
 
-  const toolProbe = await provider.probeToolCalling();
-  if (toolProbe.ok) ok(toolProbe.detail);
-  else {
-    fail(toolProbe.detail);
-    summary.ok = false;
-  }
+  if (!probe.ok) {
+    // Probing tool calling on top of a broken completion only produces a
+    // second, more confusing failure (it used to read as "agent mode is off").
+    const live = await bridgeHealth({
+      host: config.bridge.host,
+      port: config.bridge.port,
+      authToken,
+    });
+    if (live.tokenCount === 0) {
+      summary.needsTokens = true;
+      log(paint.dim("  no device tokens in the pool — `zeke tokens collect` harvests a batch"));
+    }
+    log(paint.dim("  skipping the tool-call probe until a completion works"));
+  } else {
+    const toolProbe = await provider.probeToolCalling();
+    if (toolProbe.ok) ok(toolProbe.detail);
+    else {
+      fail(toolProbe.detail);
+      summary.ok = false;
+    }
 
-  if (!summary.hasToken) {
-    warn("guest session: only glm-5.3-flash and glm-4.7 are available, and image input is rejected");
+    if (!summary.hasToken) {
+      warn("guest session: only glm-5.3-flash and glm-4.7 are available, and image input is rejected");
+    }
   }
   summary.steps.push("verify");
 
@@ -217,6 +249,9 @@ function report(summary, paint, log, flags, model) {
   log(`  ${paint.bold('zeke -p "explain this repo"')} ${paint.dim("one-shot, headless")}`);
   log(`  ${paint.bold("zeke doctor")} ${paint.dim("re-check everything")}`);
   if (summary.binary) log(`  ${paint.bold("zeke bridge logs")} ${paint.dim(`tail ${paths.bridgeLog()}`)}`);
+  if (summary.needsTokens) {
+    log(`  ${paint.bold("zeke tokens collect")} ${paint.dim("harvest device tokens — one is spent per request's captcha")}`);
+  }
   if (!summary.hasToken) log(`  ${paint.bold("zeke setup --token <jwt>")} ${paint.dim("unlock all models with a chat.z.ai token")}`);
   log("");
   if (flags.json) process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);

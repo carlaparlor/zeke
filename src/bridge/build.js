@@ -23,10 +23,12 @@ const VENDOR_SKIP = new Set([".git", ".assets", "tests"]);
  * Order of preference: already vendored → extract from the zip in the repo →
  * clone from GitHub. Returns what it did.
  *
- * @param {{zip?: string, refresh?: boolean, log?: (msg: string) => void}} [options]
+ * @param {{zip?: string, refresh?: boolean, dest?: string, log?: (msg: string) => void}} [options]
  */
 export async function ensureVendored(options = {}) {
-  const target = paths.vendoredBridge();
+  // `dest` lets tests (and anyone vendoring somewhere else) work in their own
+  // directory instead of the one shared copy under the repo.
+  const target = options.dest ? path.resolve(options.dest) : paths.vendoredBridge();
   const log = options.log ?? (() => {});
 
   if (!options.refresh && (await hasGoSource(target))) {

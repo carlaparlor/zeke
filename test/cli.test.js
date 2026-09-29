@@ -93,6 +93,25 @@ describe("headless runs", () => {
     }
   });
 
+  test("surfaces an inline stream error instead of an empty answer", async () => {
+    const box = await sandbox();
+    const bridge = await startMockBridge({
+      responder: scripted([{ inlineError: { message: "captcha generation returned empty payload", type: "api_error", code: 500 } }]),
+    });
+    try {
+      const result = await zeke(["-p", "hello zeke"], {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: bridge.baseUrl, ZEKE_API_KEY: "Waguri", ZEKE_MODEL: "glm-4.7" },
+      });
+      assert.equal(result.code, 1);
+      assert.match(result.stdout, /captcha generation returned empty payload/);
+      assert.match(result.stdout, /error/);
+    } finally {
+      await bridge.close();
+      await box.cleanup();
+    }
+  });
+
   test("accepts piped stdin as the prompt context", async () => {
     const box = await sandbox();
     const bridge = await startMockBridge();
@@ -473,6 +492,29 @@ describe("doctor", () => {
     }
   });
 
+  test("an empty device-token pool is a failure with the fix attached", async () => {
+    const box = await sandbox();
+    const bridge = await startMockBridge({ tokenCount: 0, requiresTokens: true });
+    try {
+      const result = await zeke(["doctor", "--json"], {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: bridge.baseUrl, ZEKE_API_KEY: "Waguri", ZEKE_MODEL: "glm-4.7" },
+      });
+      assert.equal(result.code, 1);
+      const report = JSON.parse(result.stdout);
+      assert.equal(report.ok, false);
+      const byName = Object.fromEntries(report.checks.map((c) => [c.name, c]));
+      assert.equal(byName["device tokens"].status, "fail");
+      assert.match(byName["device tokens"].hint, /zeke tokens collect/);
+      assert.equal(byName.completion.status, "fail");
+      assert.match(byName.completion.detail, /captcha/);
+      assert.match(byName.completion.detail, /zeke tokens collect/);
+    } finally {
+      await bridge.close();
+      await box.cleanup();
+    }
+  });
+
   test("flags a bridge that is not running", async () => {
     const box = await sandbox();
     try {
@@ -669,6 +711,52 @@ describe("bridge command", () => {
       assert.equal(result.code, 1);
       assert.match(result.stdout, /bridge binary not found|zeke setup/);
     } finally {
+      await box.cleanup();
+    }
+  });
+});
+
+describe("setup verification", () => {
+  // These run the real setup against the mock bridge, pointed at it the same
+  // way a user points at a bridge they did not let zeke start: ZEKE_BASE_URL
+  // decides both the provider's URL and the bridge-management target.
+  const setupArgs = ["setup", "--skip-build", "--no-start", "--no-token", "--auth-token", "Waguri"];
+
+  test("a bridge with no device tokens reports the captcha cause and skips the tool probe", async () => {
+    const box = await sandbox();
+    const bridge = await startMockBridge({ tokenCount: 0, requiresTokens: true, authToken: "Waguri" });
+    try {
+      const result = await zeke(setupArgs, {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: bridge.baseUrl },
+      });
+      assert.equal(result.code, 1);
+      assert.match(result.stdout, /no device tokens/);
+      assert.match(result.stdout, /captcha generation returned empty payload/);
+      assert.match(result.stdout, /skipping the tool-call probe/);
+      // The old failure message blamed agent mode; it must not come back.
+      assert.doesNotMatch(result.stdout, /without --agent-mode/);
+      assert.match(result.stdout, /zeke tokens collect/);
+    } finally {
+      await bridge.close();
+      await box.cleanup();
+    }
+  });
+
+  test("a working bridge verifies completions and tool calling", async () => {
+    const box = await sandbox();
+    const bridge = await startMockBridge({ tokenCount: 42, authToken: "Waguri" });
+    try {
+      const result = await zeke(setupArgs, {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: bridge.baseUrl },
+      });
+      assert.equal(result.code, 0, result.stdout + result.stderr);
+      assert.match(result.stdout, /42 device tokens/);
+      assert.match(result.stdout, /agent mode is on/);
+      assert.match(result.stdout, /zeke is ready/);
+    } finally {
+      await bridge.close();
       await box.cleanup();
     }
   });

@@ -1,15 +1,18 @@
 // `zeke tokens …` — device-token management.
 //
-// Two ways to give the bridge a usable Z.AI identity:
-//   * a personal JWT (`zeke tokens token <jwt>`) — one value, all models
-//   * harvested device tokens (`zeke tokens collect`) — a pool the bridge
-//     consumes FIFO, no account needed
-// Both end with the running bridge picking the change up without a restart.
+// Device tokens are the credential the bridge cannot work without: it mints an
+// Aliyun captcha for every request and each captcha spends one token from this
+// pool (`internal/zbridge/captcha.go`). Harvested tokens (`zeke tokens
+// collect`) are therefore the baseline setup; a personal JWT
+// (`zeke tokens token <jwt>`) is the optional extra that unlocks every model
+// and image input. Both end with the running bridge picking the change up
+// without a restart.
 
 import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { paths } from "../lib/paths.js";
 import { saveSecrets, maskSecret } from "../config/index.js";
+import { buildBridge } from "../bridge/build.js";
 import { health as bridgeHealth, swapTokenDb } from "../bridge/bridge.js";
 import { bridgeConfigFrom } from "./bridge-cli.js";
 import { style } from "../ui/ansi.js";
@@ -41,10 +44,13 @@ export async function tokensCommand({ flags, positional, config }) {
     out(`  listening    ${live.listening ? paint.green("yes") : paint.red("no")}`);
     out(`  session      ${live.healthy ? paint.green("initialised") : paint.red("not initialised")}`);
     out(`  pool         ${live.tokenCount < 0 ? paint.dim("unknown") : `${live.tokenCount} device tokens`}`);
-    if (!config.hasZaiToken && live.tokenCount <= 0) {
+    if (live.tokenCount === 0) {
       out("");
-      out(paint.dim("  neither credential is present, so the bridge can only run as a guest."));
-      out(paint.dim("  `zeke tokens token <jwt>`  or  `zeke tokens collect`"));
+      out(paint.yellow("  the pool is empty: the bridge spends one device token on every request's"));
+      out(paint.yellow("  Aliyun captcha, so nothing can complete — `zeke tokens collect`"));
+    } else if (live.tokenCount < 0 && !config.hasZaiToken) {
+      out("");
+      out(paint.dim("  no Z.AI token and no token count yet — `zeke tokens collect` harvests a batch."));
     }
     return live.listening ? 0 : 1;
   }
@@ -86,16 +92,23 @@ export async function tokensCommand({ flags, positional, config }) {
 
   if (action === "collect") {
     const collector = paths.collectorBinary();
-    let info;
-    try {
-      info = await stat(collector);
-    } catch {
-      out(`${paint.red("✗")} token-collector not built (${collector})`);
-      out(paint.dim("  build it with `zeke setup`, or pass --token <jwt> to skip harvesting entirely"));
-      out(paint.dim("  harvesting also needs Playwright browsers: npx playwright install chromium"));
-      return 1;
+    if (!(await fileExists(collector))) {
+      // The collector is only ever built as part of `zeke setup`, and setup
+      // skips the build when a bridge binary is already configured — so the
+      // one command that fixes an empty pool could not build what it needed.
+      // Build it here instead, from the same vendored source.
+      out(paint.dim(`collector not built — building it from ${paths.vendoredBridge()}`));
+      try {
+        const built = await buildBridge({ collector: true, log: (m) => out(paint.dim(`  ${m}`)) });
+        if (!built.collector) throw new Error("the Go build did not produce a token-collector binary");
+        out(`${paint.green("✓")} built ${built.collector}`);
+      } catch (err) {
+        out(`${paint.red("✗")} token-collector not built (${collector}) — ${err.message}`);
+        out(paint.dim("  build it with `zeke setup` (it needs Go and the vendored source)"));
+        out(paint.dim("  harvesting also needs Playwright browsers: npx playwright install chromium"));
+        return 1;
+      }
     }
-    void info;
 
     const args = [];
     if (flags.tokens) args.push("--tokens", String(flags.tokens));
@@ -127,6 +140,15 @@ export async function tokensCommand({ flags, positional, config }) {
   }
 
   return 0;
+}
+
+async function fileExists(file) {
+  try {
+    await stat(file);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function describeDb(file) {

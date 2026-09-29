@@ -1,6 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { SseDecoder, OpenAiChunkAccumulator, isDoneMarker } from "../src/providers/sse.js";
+import { SseDecoder, OpenAiChunkAccumulator, inlineErrorOf, isDoneMarker } from "../src/providers/sse.js";
 import { toOpenAiMessages, toOpenAiTools, repairHistory, finalizeToolCall, stripSchema } from "../src/providers/messages.js";
 import { createOpenAiProvider, ProviderError, classifyStatus } from "../src/providers/openai.js";
 import { createGlmProvider, isGuestModel, GLM_MODEL_PRESETS } from "../src/providers/glm.js";
@@ -56,6 +56,14 @@ describe("SSE decoding", () => {
     const events = decode(["event: message\nid: 7\ndata: {}\n\n"]);
     assert.equal(events[0].event, "message");
     assert.equal(events[0].id, "7");
+  });
+
+  test("recognises an inline error payload", () => {
+    assert.equal(inlineErrorOf({ choices: [] }), null);
+    assert.equal(inlineErrorOf(null), null);
+    assert.equal(inlineErrorOf([{ error: {} }]), null);
+    assert.deepEqual(inlineErrorOf({ error: { message: "boom", code: 500 } }), { message: "boom", code: 500 });
+    assert.deepEqual(inlineErrorOf({ error: "boom" }), { message: "boom" });
   });
 });
 
@@ -333,6 +341,79 @@ describe("provider against the mock bridge", () => {
       assert.equal(error.kind, "overloaded");
       assert.equal(error.retryAfterMs, 30_000);
       assert.match(error.message, /rate-limiting/);
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  test("an inline 200-stream error is surfaced instead of an empty reply", async () => {
+    // The bridge's streaming branch commits a 200 before the upstream call, so
+    // failures arrive as `data: {"error": …}` + `[DONE]` rather than a status.
+    const bridge = await startMockBridge({
+      responder: scripted([{ inlineError: { message: "captcha generation returned empty payload", type: "api_error", code: 500, param: null } }]),
+    });
+    try {
+      const provider = createOpenAiProvider({ baseUrl: bridge.baseUrl, apiKey: "Waguri", model: "glm-4.7", retries: 0 });
+      let error;
+      let final;
+      const text = [];
+      for await (const event of provider.stream({ messages: [{ role: "user", content: "hi" }] })) {
+        if (event.type === "error") error = event.error;
+        if (event.type === "text") text.push(event.text);
+        if (event.type === "message") final = event.message;
+      }
+      assert.ok(error, "the inline error must produce an error event");
+      assert.equal(error.kind, "server_error");
+      assert.match(error.message, /captcha generation returned empty payload/);
+      assert.equal(final.stopReason, "error");
+      assert.equal(text.join(""), "");
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  test("an inline WAF block is classified as overloaded", async () => {
+    const bridge = await startMockBridge({
+      responder: scripted([
+        {
+          inlineError: {
+            message: "chat.z.ai has temporarily blocked this server's IP (Aliyun WAF).",
+            type: "overloaded_error",
+            code: 503,
+          },
+        },
+      ]),
+    });
+    try {
+      const provider = createOpenAiProvider({ baseUrl: bridge.baseUrl, apiKey: "Waguri", model: "glm-4.7", retries: 0 });
+      let error;
+      for await (const event of provider.stream({ messages: [{ role: "user", content: "hi" }] })) {
+        if (event.type === "error") error = event.error;
+      }
+      assert.equal(error.kind, "overloaded");
+      assert.equal(error.retryAfterMs, 30_000);
+      assert.match(error.message, /rate-limiting/);
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  test("an empty device-token pool names the captcha and the fix", async () => {
+    const bridge = await startMockBridge({ tokenCount: 0, requiresTokens: true });
+    try {
+      const provider = createGlmProvider({ baseUrl: bridge.baseUrl, apiKey: "Waguri", model: "glm-4.7" });
+      const probe = await provider.probe();
+      assert.equal(probe.ok, false);
+      assert.match(probe.detail, /no device tokens/);
+      assert.match(probe.detail, /captcha generation returned empty payload/);
+      assert.match(probe.detail, /zeke tokens collect/);
+
+      // The tool probe must report the captcha failure, not invent an
+      // "--agent-mode is off" verdict the way it used to.
+      const toolProbe = await provider.probeToolCalling();
+      assert.equal(toolProbe.ok, false);
+      assert.match(toolProbe.detail, /captcha generation returned empty payload/);
+      assert.doesNotMatch(toolProbe.detail, /without --agent-mode/);
     } finally {
       await bridge.close();
     }

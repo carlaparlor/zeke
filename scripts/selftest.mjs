@@ -77,6 +77,9 @@ await (await import("node:fs/promises")).mkdir(work, { recursive: true });
 // anything else talks to the bridge. Keying off the conversation keeps every
 // check independent of what ran before it.
 const bridge = await startMockBridge({
+  // A working bridge always has a device-token pool: `zeke doctor` treats an
+  // empty one as a failure, because the captcha path cannot answer then.
+  tokenCount: 250,
   responder: (body, state, ctx) => {
     const last = [...(body.messages ?? [])].reverse().find((m) => m.role === "user");
     const text = typeof last?.content === "string" ? last.content : JSON.stringify(last?.content ?? "");
