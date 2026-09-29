@@ -10,7 +10,7 @@
 //   * `reasoning` / `reasoning_effort` are forwarded per-model, `webSearch`
 //     is force-disabled by the bridge while agent mode is on.
 
-import { OpenAiChunkAccumulator, SseDecoder, isDoneMarker, normalizeUsage, readBodyAsText } from "./sse.js";
+import { OpenAiChunkAccumulator, SseDecoder, inlineErrorOf, isDoneMarker, normalizeUsage, readBodyAsText } from "./sse.js";
 import { finalizeToolCall, repairHistory, toOpenAiMessages, toOpenAiTools } from "./messages.js";
 
 export class ProviderError extends Error {
@@ -192,6 +192,9 @@ export function createOpenAiProvider(config) {
         } catch {
           continue; // keep-alive ping or a split line: nothing to act on
         }
+        // The bridge streams upstream failures inline with a 200 status.
+        const inlineError = inlineErrorOf(json);
+        if (inlineError) throw fromInlineError(inlineError, config.baseUrl);
         acc.add(json);
 
         const delta = json?.choices?.[0]?.delta ?? {};
@@ -227,8 +230,13 @@ export function createOpenAiProvider(config) {
     for (const event of decoder.flush()) {
       if (isDoneMarker(event)) continue;
       try {
-        acc.add(JSON.parse(event.data));
-      } catch {
+        const json = JSON.parse(event.data);
+        // An inline error that arrived without its blank line still counts.
+        const inlineError = inlineErrorOf(json);
+        if (inlineError) throw fromInlineError(inlineError, config.baseUrl);
+        acc.add(json);
+      } catch (err) {
+        if (err instanceof ProviderError) throw err;
         // ignore: an unterminated tail line carries no signal
       }
     }
@@ -314,32 +322,56 @@ function fromResponse(response, text, baseUrl) {
   } catch {
     parsed = undefined;
   }
-  const body = parsed?.error ?? parsed;
-  const message = body?.message ?? body?.error?.message ?? (text ? text.slice(0, 400) : `HTTP ${response.status}`);
-  const code = body?.code;
   const retryAfter = Number(response.headers?.get?.("retry-after")) || undefined;
+  return providerErrorFromBody({
+    status: response.status,
+    body: parsed?.error ?? parsed,
+    text,
+    retryAfterMs: retryAfter ? retryAfter * 1000 : undefined,
+    baseUrl,
+  });
+}
 
-  // The bridge's WAF circuit breaker: 503 + structured `waf_block`.
-  if (code === "waf_block" || body?.type === "overloaded_error") {
+/**
+ * An error the bridge delivered inside a 200 stream (see `inlineErrorOf`).
+ * Shaped like the HTTP path on purpose: same classification, same wording.
+ */
+function fromInlineError(errorBody, baseUrl) {
+  const code = typeof errorBody.code === "number" ? errorBody.code : Number(errorBody.code);
+  const status = Number.isFinite(code) && code >= 400 ? code : 500;
+  return providerErrorFromBody({ status, body: errorBody, baseUrl, inline: true });
+}
+
+/**
+ * Build the ProviderError for an error payload, whether it arrived as a
+ * non-2xx response body or as a chunk inside a 200 stream.
+ *
+ * @param {{status?: number, body?: any, text?: string, retryAfterMs?: number, baseUrl?: string, inline?: boolean}} info
+ */
+function providerErrorFromBody({ status, body, text, retryAfterMs, baseUrl, inline = false }) {
+  const message =
+    body?.message ?? body?.error?.message ?? (text ? text.slice(0, 400) : status ? `HTTP ${status}` : "the bridge reported an error");
+  const code = body?.code;
+
+  // The bridge's WAF circuit breaker: 503 + structured `waf_block`, or the
+  // same message inline when the block trips mid-stream.
+  if (code === "waf_block" || body?.type === "overloaded_error" || /temporarily blocked this server's IP/.test(message)) {
     return new ProviderError(`upstream is rate-limiting this bridge: ${message}`, {
-      status: response.status,
+      status,
       kind: "overloaded",
       retryable: true,
-      retryAfterMs: retryAfter ? retryAfter * 1000 : 30_000,
+      retryAfterMs: retryAfterMs ?? 30_000,
     });
   }
 
-  const err = new ProviderError(message, {
-    status: response.status,
-    retryAfterMs: retryAfter ? retryAfter * 1000 : undefined,
-  });
+  const err = new ProviderError(message, { status, retryAfterMs });
   if (err.kind === "auth") {
     err.message = `${message} (bridge AUTH_TOKEN mismatch — check ~/.zeke/secrets.json vs the bridge's AUTH_TOKEN)`;
   }
-  if (err.kind === "overloaded" && response.status === 503 && !retryAfter) {
+  if (err.kind === "overloaded" && status === 503 && !retryAfterMs) {
     err.message = `${message} — the bridge is not initialised with chat.z.ai yet (see \`zeke doctor\`)`;
   }
-  err.detail = { baseUrl, body: parsed };
+  err.detail = { baseUrl, body, inline };
   return err;
 }
 

@@ -11,7 +11,7 @@ refs/
 # GLM-Free-API zip via scripts/vendor-bridge.sh, so it is not committed.
 vendor/
 
-# A downloaded Go toolchain, if `zeke setup` had to fetch one.
+# A Go toolchain unpacked here by hand (zeke looks in $ZEKE_HOME/go too).
 .go/
 
 # zeke runtime state when ZEKE_HOME points inside the checkout

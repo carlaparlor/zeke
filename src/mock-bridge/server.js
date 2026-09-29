@@ -38,6 +38,10 @@ const FALLBACK_MODELS = [
  * @property {boolean} [agentMode]     mirrors the bridge's --agent-mode
  * @property {boolean} [healthy]       false → /health 503, completions 503
  * @property {number} [tokenCount]
+ * @property {boolean} [requiresTokens] with an empty pool, fail completions the
+ *   way the real captcha path does: 500 when `stream:false`, and — because the
+ *   streaming branch has already written its 200 header — an inline
+ *   `data: {"error": …}` chunk followed by `[DONE]` when `stream:true`
  * @property {boolean} [wafBlocked]    503 + Retry-After on completions
  * @property {(req: any, state: MockState) => any} [responder]  scripted responses
  * @property {number} [chunkMs]        delay between SSE chunks
@@ -175,6 +179,19 @@ export async function startMockBridge(options = {}) {
 
       // The bridge silently defaults a missing model to glm-5.
       const model = body.model ?? "glm-5";
+
+      // With `requiresTokens` and an empty pool, the captcha cannot be minted
+      // (captcha.go: "captcha generation returned empty payload"). The real
+      // bridge answers 500 for non-streaming requests but has already
+      // committed a 200 for streaming ones, so the failure goes out inline.
+      if (options.requiresTokens && state.tokenCount <= 0) {
+        const error = { message: "captcha generation returned empty payload", type: "api_error", code: 500, param: null };
+        if (body.stream === false) {
+          return send(500, { error });
+        }
+        return streamReply(res, { inlineError: error }, model, options);
+      }
+
       const reply = await responder(body, state, { agentMode: options.agentMode !== false, model });
 
       if (body.stream === false) {
@@ -273,6 +290,8 @@ export function defaultResponder(body, state, { agentMode }) {
  *   { toolCalls: [{name, arguments}] }
  *   { text, toolCalls }
  *   { error: { status, body } }    HTTP failure
+ *   { inlineError: {...} }         200 + `data: {"error": …}` + [DONE],
+ *                                  the bridge's streaming-branch failure shape
  *   () => reply                    lazy
  */
 export function scripted(replies) {
@@ -315,6 +334,13 @@ async function streamReply(res, reply, model, options) {
     "cache-control": "no-cache",
     connection: "keep-alive",
   });
+
+  if (reply.inlineError) {
+    res.write(`data: ${JSON.stringify({ error: reply.inlineError })}\n\n`);
+    res.write("data: [DONE]\n\n");
+    res.end();
+    return;
+  }
 
   const id = `chatcmpl-mock-${randomUUID().slice(0, 8)}`;
   const chunkMs = options.chunkMs ?? 0;

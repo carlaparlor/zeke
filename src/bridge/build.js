@@ -23,10 +23,12 @@ const VENDOR_SKIP = new Set([".git", ".assets", "tests"]);
  * Order of preference: already vendored → extract from the zip in the repo →
  * clone from GitHub. Returns what it did.
  *
- * @param {{zip?: string, refresh?: boolean, log?: (msg: string) => void}} [options]
+ * @param {{zip?: string, refresh?: boolean, dest?: string, log?: (msg: string) => void}} [options]
  */
 export async function ensureVendored(options = {}) {
-  const target = paths.vendoredBridge();
+  // `dest` lets tests (and anyone vendoring somewhere else) work in their own
+  // directory instead of the one shared copy under the repo.
+  const target = options.dest ? path.resolve(options.dest) : paths.vendoredBridge();
   const log = options.log ?? (() => {});
 
   if (!options.refresh && (await hasGoSource(target))) {
@@ -251,7 +253,8 @@ export async function buildBridge(options = {}) {
     });
     steps.push({ name: "go build token-collector", code: collectorBuild.code });
     if (collectorBuild.code !== 0) {
-      // The collector needs Playwright browsers; treat a failure as optional.
+      // The collector needs a Go toolchain (it installs its own Playwright driver
+      // and Chromium at run time); treat a build failure as optional.
       log(`token-collector build failed (optional): ${collectorBuild.stderr.trim().split("\n")[0]}`);
       collector = undefined;
     } else {

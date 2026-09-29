@@ -48,6 +48,9 @@ export const infoCommands = {
       out(paint.dim(`guest session: only ${GLM_MODEL_PRESETS.filter((m) => m.guest).map((m) => m.id).join(" and ")} will be accepted`));
       out(paint.dim("a token lifts that: zeke tokens token <jwt>"));
     }
+    out("");
+    out(paint.dim("every request also spends one harvested device token on its Aliyun captcha"));
+    out(paint.dim("check that pool with `zeke tokens status`, refill it with `zeke tokens collect`"));
     void isGuestModel;
     return 0;
   },

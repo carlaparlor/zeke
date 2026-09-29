@@ -30,6 +30,32 @@ export function isGuestModel(model) {
 }
 
 /**
+ * The bridge mints one Aliyun captcha for *every* completion
+ * (`internal/zbridge/captcha.go`) and each one burns a device token from the
+ * harvested pool. A ZAI_TOKEN does not remove that requirement — it only
+ * decides which identity and which models the session gets — so an empty pool
+ * fails every request, guest or not, with one of these signatures.
+ */
+const CAPTCHA_FAILURE = /captcha|device tokens? (remaining|available)|token retries exhausted/i;
+
+/** The one command that refills the pool. */
+export const DEVICE_TOKEN_REMEDY =
+  "each request spends a harvested device token on its Aliyun captcha — refill the pool with `zeke tokens collect`";
+
+/**
+ * Turn a completion failure into the action that fixes it. Returns "" when the
+ * failure is unrelated to the captcha.
+ *
+ * @param {string} detail
+ * @param {number} [tokenCount] from the bridge's /health; 0 means the pool is empty
+ */
+export function diagnoseCompletionFailure(detail, tokenCount) {
+  if (tokenCount !== 0 && !CAPTCHA_FAILURE.test(detail)) return "";
+  const state = tokenCount === 0 ? "the device-token pool is empty: " : "";
+  return ` — ${state}${DEVICE_TOKEN_REMEDY}`;
+}
+
+/**
  * @typedef {object} GlmProviderConfig
  * @property {string} [baseUrl]   default http://127.0.0.1:3001/v1
  * @property {string} [apiKey]    bridge AUTH_TOKEN
@@ -82,7 +108,7 @@ export function createGlmProvider(config = {}) {
           ok: completion.ok,
           detail: completion.ok
             ? `healthy${tokenNote} — ${completion.detail}`
-            : `healthy${tokenNote} but completion failed — ${completion.detail}`,
+            : `healthy${tokenNote} but completion failed — ${completion.detail}${diagnoseCompletionFailure(completion.detail, tokens)}`,
         };
       } catch (err) {
         return { ok: false, detail: `bridge not reachable at ${root}: ${err.message}` };
@@ -131,8 +157,19 @@ export function createGlmProvider(config = {}) {
         failure = err;
       }
 
-      if (failure) return { ok: false, detail: `probe failed: ${failure.message}` };
+      // A failure here is *not* evidence about agent mode: the request never
+      // reached the model. Report what actually went wrong, since claiming
+      // "--agent-mode is off" for a captcha or session error sends the user
+      // chasing the wrong problem.
+      if (failure) return { ok: false, detail: `probe failed: ${failure.message}${diagnoseCompletionFailure(failure.message)}` };
       if (sawToolCall) return { ok: true, detail: "agent mode is on — tool calls come back" };
+      if (!text) {
+        return {
+          ok: false,
+          detail:
+            "the bridge returned an empty stream — no prose, no tool call, no error. Check `zeke bridge logs`; if the bridge is fine, restart it with `zeke bridge restart` so AGENT_MODE is on.",
+        };
+      }
       return {
         ok: false,
         detail: `no tool call returned (got prose: ${JSON.stringify(text.slice(0, 80))}). The bridge is running without --agent-mode; tool calling is disabled. Restart it with \`zeke bridge restart\` (zeke passes AGENT_MODE automatically).`,

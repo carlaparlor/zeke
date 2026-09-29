@@ -93,6 +93,25 @@ describe("headless runs", () => {
     }
   });
 
+  test("surfaces an inline stream error instead of an empty answer", async () => {
+    const box = await sandbox();
+    const bridge = await startMockBridge({
+      responder: scripted([{ inlineError: { message: "captcha generation returned empty payload", type: "api_error", code: 500 } }]),
+    });
+    try {
+      const result = await zeke(["-p", "hello zeke"], {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: bridge.baseUrl, ZEKE_API_KEY: "Waguri", ZEKE_MODEL: "glm-4.7" },
+      });
+      assert.equal(result.code, 1);
+      assert.match(result.stdout, /captcha generation returned empty payload/);
+      assert.match(result.stdout, /error/);
+    } finally {
+      await bridge.close();
+      await box.cleanup();
+    }
+  });
+
   test("accepts piped stdin as the prompt context", async () => {
     const box = await sandbox();
     const bridge = await startMockBridge();
@@ -467,6 +486,35 @@ describe("doctor", () => {
       assert.equal(byName["tool calling"].status, "ok");
       assert.equal(byName.tools.status, "ok");
       assert.match(byName["device tokens"].detail, /42/);
+      // A supplied pool needs no harvesting advice.
+      assert.equal(byName["harvest path"], undefined);
+    } finally {
+      await bridge.close();
+      await box.cleanup();
+    }
+  });
+
+  test("an empty device-token pool is a failure with the fix attached", async () => {
+    const box = await sandbox();
+    const bridge = await startMockBridge({ tokenCount: 0, requiresTokens: true });
+    try {
+      const result = await zeke(["doctor", "--json"], {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: bridge.baseUrl, ZEKE_API_KEY: "Waguri", ZEKE_MODEL: "glm-4.7" },
+      });
+      assert.equal(result.code, 1);
+      const report = JSON.parse(result.stdout);
+      assert.equal(report.ok, false);
+      const byName = Object.fromEntries(report.checks.map((c) => [c.name, c]));
+      assert.equal(byName["device tokens"].status, "fail");
+      assert.match(byName["device tokens"].hint, /zeke tokens collect/);
+      // The pool is empty — doctor must also say whether harvesting can run.
+      assert.ok(byName["harvest path"], "an empty pool should be followed by a harvest-path check");
+      assert.notEqual(byName["harvest path"].status, "ok");
+      assert.match(byName["harvest path"].hint, /Go|collect/);
+      assert.equal(byName.completion.status, "fail");
+      assert.match(byName.completion.detail, /captcha/);
+      assert.match(byName.completion.detail, /zeke tokens collect/);
     } finally {
       await bridge.close();
       await box.cleanup();
@@ -584,13 +632,62 @@ describe("tokens", () => {
     }
   });
 
-  test("collect fails clearly when the collector is not built", async () => {
+  test("collect names the blocker when the collector cannot be built", async () => {
     const box = await sandbox();
     try {
-      const result = await zeke(["tokens", "collect"], { cwd: box.cwd, env: { ZEKE_HOME: box.home } });
+      // A sandbox with no Go on PATH and no vendor/: harvesting is impossible,
+      // and the message has to say which prerequisite is missing and how to
+      // get it — "not built" alone leaves the user stuck.
+      const result = await zeke(["tokens", "collect"], { cwd: box.cwd, env: { ZEKE_HOME: box.home, PATH: "/nonexistent" } });
       assert.equal(result.code, 1);
-      assert.match(result.stdout, /token-collector not built/);
+      assert.match(result.stdout, /the token collector cannot be built/);
+      assert.match(result.stdout, /Go|bridge source/);
+      assert.match(result.stdout, /↳/);
     } finally {
+      await box.cleanup();
+    }
+  });
+
+  test("collect --dry-run reports the prerequisites without running anything", async () => {
+    const box = await sandbox();
+    try {
+      const result = await zeke(["tokens", "collect", "--dry-run"], {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, PATH: "/nonexistent" },
+      });
+      assert.equal(result.code, 1);
+      assert.match(result.stdout, /harvesting prerequisites/);
+      assert.match(result.stdout, /collector/);
+      assert.match(result.stdout, /browsers/);
+      assert.match(result.stdout, /blocker:/);
+    } finally {
+      await box.cleanup();
+    }
+  });
+
+  test("collect runs the collector from ZEKE_HOME and hot-swaps the pool it wrote", async () => {
+    const box = await sandbox();
+    const bridge = await startMockBridge({ tokenCount: 7 });
+    try {
+      // The upstream collector writes ./tokens.sqlite in its *cwd* and has no
+      // --db-path flag, so a stand-in that does the same is the honest test:
+      // zeke must run it where the bridge reads the pool from.
+      const collector = path.join(box.home, "bin", process.platform === "win32" ? "token-collector.exe" : "token-collector");
+      await mkdir(path.dirname(collector), { recursive: true });
+      await writeFile(collector, "#!/bin/sh\nprintf 'SQLite format 3\\000' > ./tokens.sqlite\necho harvested\n");
+      await chmod(collector, 0o755);
+
+      const result = await zeke(["tokens", "collect", "--tokens", "5", "--no-tui"], {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: bridge.baseUrl, ZEKE_API_KEY: "Waguri" },
+      });
+      assert.equal(result.code, 0, result.stdout + result.stderr);
+      assert.match(result.stdout, /harvested into/);
+      assert.match(result.stdout, /hot-swapped into the running bridge/);
+      assert.equal(bridge.state.dbPath, path.join(box.home, "tokens.sqlite"));
+      assert.match(result.stdout, /7 tokens/);
+    } finally {
+      await bridge.close();
       await box.cleanup();
     }
   });
@@ -669,6 +766,52 @@ describe("bridge command", () => {
       assert.equal(result.code, 1);
       assert.match(result.stdout, /bridge binary not found|zeke setup/);
     } finally {
+      await box.cleanup();
+    }
+  });
+});
+
+describe("setup verification", () => {
+  // These run the real setup against the mock bridge, pointed at it the same
+  // way a user points at a bridge they did not let zeke start: ZEKE_BASE_URL
+  // decides both the provider's URL and the bridge-management target.
+  const setupArgs = ["setup", "--skip-build", "--no-start", "--no-token", "--auth-token", "Waguri"];
+
+  test("a bridge with no device tokens reports the captcha cause and skips the tool probe", async () => {
+    const box = await sandbox();
+    const bridge = await startMockBridge({ tokenCount: 0, requiresTokens: true, authToken: "Waguri" });
+    try {
+      const result = await zeke(setupArgs, {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: bridge.baseUrl },
+      });
+      assert.equal(result.code, 1);
+      assert.match(result.stdout, /no device tokens/);
+      assert.match(result.stdout, /captcha generation returned empty payload/);
+      assert.match(result.stdout, /skipping the tool-call probe/);
+      // The old failure message blamed agent mode; it must not come back.
+      assert.doesNotMatch(result.stdout, /without --agent-mode/);
+      assert.match(result.stdout, /zeke tokens collect/);
+    } finally {
+      await bridge.close();
+      await box.cleanup();
+    }
+  });
+
+  test("a working bridge verifies completions and tool calling", async () => {
+    const box = await sandbox();
+    const bridge = await startMockBridge({ tokenCount: 42, authToken: "Waguri" });
+    try {
+      const result = await zeke(setupArgs, {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: bridge.baseUrl },
+      });
+      assert.equal(result.code, 0, result.stdout + result.stderr);
+      assert.match(result.stdout, /42 device tokens/);
+      assert.match(result.stdout, /agent mode is on/);
+      assert.match(result.stdout, /zeke is ready/);
+    } finally {
+      await bridge.close();
       await box.cleanup();
     }
   });
