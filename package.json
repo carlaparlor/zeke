@@ -1,0 +1,45 @@
+{
+  "name": "zeke",
+  "version": "0.1.0",
+  "description": "zeke \u2014 a terminal coding agent built for GLM-Free-API. omp's harness design, GLM as the brain.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "zeke": "bin/zeke.mjs"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./tools": "./src/tools/index.js",
+    "./providers": "./src/providers/index.js",
+    "./plugins": "./src/plugins/api.js",
+    "./mock-bridge": "./src/mock-bridge/server.js"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "files": [
+    "bin",
+    "src",
+    "vendor",
+    "scripts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "test:only": "node --test",
+    "selftest": "node scripts/selftest.mjs",
+    "zeke": "node bin/zeke.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "keywords": [
+    "agent",
+    "ai",
+    "cli",
+    "coding-agent",
+    "glm",
+    "zai",
+    "terminal"
+  ]
+}
