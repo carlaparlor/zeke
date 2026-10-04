@@ -5,14 +5,16 @@
 // cover everything else.
 
 import { createInterface } from "node:readline";
+import { existsSync } from "node:fs";
 import { ZekeRuntime, deriveTitle } from "../core/runtime.js";
 import { createRenderer } from "../ui/render.js";
 import { createApprovalPrompt } from "../ui/approve.js";
 import { style, stripAnsi, SYMBOLS, colorEnabled } from "../ui/ansi.js";
-import { displayPath } from "../lib/paths.js";
+import { displayPath, paths } from "../lib/paths.js";
 import { SessionStore } from "../session/store.js";
 import { listPlugins } from "../plugins/index.js";
 import { health as bridgeHealth } from "../bridge/bridge.js";
+import { bridgeCommand } from "./bridge-cli.js";
 import { GLM_MODEL_PRESETS } from "../providers/glm.js";
 import { Events } from "../lib/events.js";
 
@@ -80,8 +82,17 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
   const ask = (question, options) => promptUser(question, options, { rl, paint });
   runtime.askHandler = ask;
 
+  // The renderer prints every model error the moment it arrives, so the turn
+  // summary below needs to know whether the failure on screen is one the user
+  // has already read.
+  let lastModelError = "";
+  runtime.events.on(Events.MODEL_ERROR, (data) => {
+    lastModelError = String(data?.error?.message ?? "");
+  });
+
   async function runTurn(input) {
     running = true;
+    lastModelError = "";
     currentAbort = new AbortController();
     const onSigint = () => {
       if (running) {
@@ -96,8 +107,11 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
       if (result.stopped === "max_turns") {
         write(paint.yellow(`stopped after ${result.turns} turns (raise with --max-turns)`));
       } else if (result.stopped === "error") {
-        write(paint.red(result.finalText || "the model reported an error"));
-        hintForError(result.finalText);
+        const message = String(result.finalText || "the model reported an error");
+        // The renderer already showed this exact failure; repeating it here
+        // would print the same line twice.
+        if (message !== lastModelError) write(paint.red(message));
+        hintForError(message);
       }
     } catch (err) {
       write(paint.red(err.message));
@@ -112,12 +126,23 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
 
   function hintForError(message) {
     const text = String(message ?? "");
-    if (/cannot reach|ECONNREFUSED|unreachable/i.test(text)) {
-      write(paint.dim("hint: the bridge is not running — try `zeke bridge start`, or `/bridge`"));
+    if (/cannot reach|ECONNREFUSED|connection refused|unreachable/i.test(text)) {
+      // Naming a shell command is useless while the user is sitting inside the
+      // REPL: say what fixes it here, and only mention `zeke setup` when there
+      // is no bridge binary to start in the first place.
+      if (existsSync(runtime.config.bridge.binary ?? paths.bridgeBinary())) {
+        write(paint.dim("hint: the bridge is not running — `/bridge start` starts it from here"));
+      } else {
+        write(paint.dim("hint: no bridge binary yet — ctrl-d, then `zeke setup` (or `/doctor` to see what is missing)"));
+      }
     } else if (/authentication|AUTH_TOKEN/i.test(text)) {
-      write(paint.dim("hint: auth mismatch — `zeke doctor` shows which token zeke is sending"));
+      write(paint.dim("hint: auth mismatch — `/doctor` shows which token zeke is sending"));
     } else if (/not initialised|session not/i.test(text)) {
-      write(paint.dim("hint: the bridge has no Z.AI session — `zeke tokens status` then `zeke bridge restart`"));
+      write(
+        paint.dim(
+          "hint: the bridge has no chat.z.ai session — `/bridge restart` retries it; `zeke tokens status` checks the device-token pool",
+        ),
+      );
     }
   }
 
@@ -142,7 +167,7 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
         ["/sessions", "list saved sessions for this directory"],
         ["/resume <id>", "load a saved session"],
         ["/export [file]", "write the transcript to a markdown file"],
-        ["/bridge", "bridge health, token count and WAF state"],
+        ["/bridge [action]", "status, or start|stop|restart|logs|models"],
         ["/doctor", "run the full diagnostic"],
         ["/plugins", "list plugins"],
         ["/prompt", "print the system prompt"],
@@ -292,11 +317,21 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
       write(`${paint.green(SYMBOLS.check)} wrote ${target}`);
     },
 
-    bridge: async () => {
+    bridge: async (arg) => {
+      const [action, ...rest] = arg.trim().split(/\s+/).filter(Boolean);
+      if (action && action !== "status") {
+        // The same lifecycle commands as `zeke bridge …`, so recovery never
+        // means leaving the session — this is what the error hints point at.
+        if (action === "start" || action === "restart") {
+          write(paint.dim(`bringing the bridge up on ${runtime.config.bridge.host}:${runtime.config.bridge.port}…`));
+        }
+        await bridgeCommand({ flags: {}, positional: [action, ...rest], config: runtime.config });
+        return;
+      }
       const state = await bridgeHealth(runtime.config.bridge);
       if (!state.listening) {
         write(paint.red(`bridge is not answering at ${state.url}`));
-        write(paint.dim("start it with `zeke bridge start` (or /doctor for the full picture)"));
+        write(paint.dim("`/bridge start` starts it here, `/bridge logs` shows why it stopped, `/doctor` checks the rest"));
         return;
       }
       write(`url      ${state.url}`);
@@ -306,6 +341,7 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
       if (waf?.blocked) write(`waf      ${paint.red(`blocked, retry in ${waf.retryIn}`)}`);
       const pool = state.status?.sessionPool;
       if (pool) write(`pool     ${pool.ready}/${pool.size} ready (mode ${pool.mode})`);
+      write(paint.dim("`/bridge start|stop|restart|logs|models` controls it"));
     },
 
     doctor: async () => {

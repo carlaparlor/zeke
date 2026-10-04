@@ -1,6 +1,7 @@
 // zeke's command router.
 
 import { parseArgs, renderHelp } from "../lib/args.js";
+import { style } from "../ui/ansi.js";
 import { loadConfig } from "../config/index.js";
 import { runInteractive } from "./repl.js";
 import { runHeadless } from "./headless.js";
@@ -110,7 +111,43 @@ export async function main(argv) {
     return runHeadless(input, { config, flags, cwd });
   }
 
+  if (prompt) noteStrayCommand(prompt);
+
   return runInteractive({ config, flags, cwd, initialPrompt: prompt || undefined });
+}
+
+/**
+ * Commands that also exist behind a slash inside the session.
+ * @type {Record<string, string>}
+ */
+const IN_SESSION = {
+  bridge: "/bridge",
+  doctor: "/doctor",
+  tools: "/tools",
+  sessions: "/sessions",
+  plugins: "/plugins",
+};
+
+/**
+ * `zeke bridge start` is a shell command, but typed at the shell *through* an
+ * already-running zeke (`node bin/zeke.mjs zeke bridge start`) or pasted into
+ * the REPL it becomes a prompt, and the model then answers about a bridge it
+ * cannot see. One dim line prevents that whole detour.
+ */
+function noteStrayCommand(prompt) {
+  const words = prompt.trim().split(/\s+/);
+  // Only a bare invocation counts: "zeke setup is broken, fix it" is a real
+  // prompt, and interrupting it with advice would be noise.
+  if (words.length > 3 || words[0].toLowerCase() !== "zeke") return;
+  const command = words[1]?.toLowerCase();
+  if (!command || !(command in COMMANDS)) return;
+  const inSession = IN_SESSION[command];
+  const target = inSession ? `${inSession}${words[2] ? ` ${words[2]}` : ""}` : null;
+  const hint = target
+    ? `use \`${target}\` here`
+    : "ctrl-d leaves the session if you meant to run it in your shell";
+  const note = `note: "${words.join(" ")}" is a shell command — a session is already starting; ${hint}.`;
+  process.stderr.write(`${style.dim(note)}\n`);
 }
 
 function applyFlagOverrides(flags) {

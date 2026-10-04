@@ -135,6 +135,12 @@ Exit codes are meaningful: `0` ok, `1` error, `3` hit `--max-turns`, `130` inter
 | `/doctor` | `/plugins` | `/prompt` |
 | `/exit` | | |
 
+`/bridge` is the same lifecycle tool as `zeke bridge …`, reachable from where the failure
+appears: `/bridge start`, `/bridge restart`, `/bridge stop`, `/bridge logs`, `/bridge models`. When
+a turn fails because nothing is listening, the hint points at `/bridge start` — no need to leave
+the session to fix it. (If there is no bridge binary yet, the hint says so instead of naming a
+command that cannot work.)
+
 **Context memory.** Drop a `ZEKE.md` (or `AGENTS.md`) in your project root and zeke reads it as
 project instructions. `ZEKE.md` wins if both exist.
 
@@ -310,7 +316,7 @@ breaker's `503` + `Retry-After` backoff.
 ## Tests
 
 ```sh
-npm test          # 356 tests in 11 files
+npm test          # 372 tests in 13 files
 npm run selftest  # end-to-end: real CLI against a mock bridge
 zeke selftest     # same suite, from an installed checkout
 ```
@@ -318,7 +324,11 @@ zeke selftest     # same suite, from an installed checkout
 The suite uses `node:test` and needs no network. Integration tests run the real CLI as a
 subprocess against `src/mock-bridge/server.js`, which speaks the bridge's protocol including
 streamed tool-call argument fragments — so the SSE client, the tool-call parser and the JSON
-repair path are all exercised for real. The mock also reproduces the bridge's *streaming-branch
+repair path are all exercised for real. Two files guard the paths that fail *quietly*:
+`test/launcher.test.js` runs the CLI through an `npm link`-style symlink (a bin that decides it is
+an import exits 0 and prints nothing), and `test/repl.test.js` drives a real session through pipes
+to check the recovery advice — one failure, one line, and a fix that works from inside the
+session. The mock also reproduces the bridge's *streaming-branch
 failure shape* (HTTP 200 + `data: {"error": …}` + `[DONE]`) and its empty-pool captcha failure,
 which is how `zeke setup` and `zeke doctor` are tested against the exact confusion this repo was
 born from.
@@ -335,6 +345,18 @@ Two things are honestly **not** covered, because this sandbox cannot reach them:
 ---
 
 ## Troubleshooting
+
+**Every prompt fails with `cannot reach http://127.0.0.1:3001/v1: connection refused`.** Nothing is
+listening on the bridge port. Inside a session, `/bridge start` brings it up (and `/bridge logs`
+says why it stopped); from a shell, `zeke bridge start`. If it refuses to start, `/doctor` — or
+`zeke doctor --json` in CI — names the missing piece, usually a device-token pool or the Go
+toolchain that builds the bridge.
+
+**An old build prints nothing at all.** Before the symlink fix, a `zeke` launched through
+`npm link` (which installs a symlink) hit the "am I the program being run?" guard with a *link*
+path on one side and the *resolved* path on the other, decided it was an import, and exited 0
+without running anything. `node bin/zeke.mjs …` from the checkout always worked. Update the
+checkout and re-`npm link` if you still see it.
 
 **`health` says `healthy` but every completion fails with
 `server_error: captcha generation returned empty payload`.** The device-token pool is empty —

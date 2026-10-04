@@ -6,6 +6,7 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, writeFile, readFile, chmod } from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import { sandbox } from "./helpers.js";
 import { startMockBridge, scripted } from "../src/mock-bridge/server.js";
@@ -40,6 +41,18 @@ function zeke(args, options = {}) {
     });
     if (options.input !== undefined) child.stdin.end(options.input);
     else child.stdin.end();
+  });
+}
+
+/** A port nothing is listening on: bind one, note the number, release it. */
+function unusedPort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      server.close(() => resolve(port));
+    });
   });
 }
 
@@ -228,6 +241,26 @@ describe("headless runs", () => {
       });
       assert.equal(result.code, 1);
       assert.match(result.stdout + result.stderr, /cannot reach|unreachable/);
+    } finally {
+      await box.cleanup();
+    }
+  });
+
+  test("an unreachable bridge is reported once, with the reason, and not retried", async () => {
+    const box = await sandbox();
+    const port = await unusedPort();
+    try {
+      const result = await zeke(["-p", "--no-stream", "hi"], {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: `http://127.0.0.1:${port}/v1`, ZEKE_API_KEY: "x" },
+      });
+      assert.equal(result.code, 1);
+      // "fetch failed" is undici's wrapper; the reason a user can act on is the
+      // code underneath it.
+      assert.match(result.stdout, /connection refused/);
+      // Not three lines for one failure, and not two copies of the same line.
+      assert.equal(result.stdout.split("cannot reach").length - 1, 1, result.stdout);
+      assert.doesNotMatch(result.stdout, /retry \d\/\d/);
     } finally {
       await box.cleanup();
     }
@@ -511,7 +544,12 @@ describe("doctor", () => {
       // The pool is empty — doctor must also say whether harvesting can run.
       assert.ok(byName["harvest path"], "an empty pool should be followed by a harvest-path check");
       assert.notEqual(byName["harvest path"].status, "ok");
-      assert.match(byName["harvest path"].hint, /Go|collect/);
+      // *Which* blocker is reported first depends on the machine — the vendored
+      // source (`zeke setup` puts it there), a Go toolchain, or the browser the
+      // collector drives — so assert that a concrete fix is named, not a shrug.
+      // Asserting on one of them made the suite fail on a fresh checkout, where
+      // nothing has vendored the source yet.
+      assert.match(byName["harvest path"].hint, /Go|collect|zeke setup|Chromium|playwright/i);
       assert.equal(byName.completion.status, "fail");
       assert.match(byName.completion.detail, /captcha/);
       assert.match(byName.completion.detail, /zeke tokens collect/);
