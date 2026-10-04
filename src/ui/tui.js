@@ -14,13 +14,16 @@
 // Non-TTY runs continue to use the line-oriented REPL.
 
 import { Writable } from "node:stream";
-import { createStyle, fitToWidth, spinnerFrames, stripAnsi, terminalSize, truncateAnsi, visibleWidth, wrapAnsiLines } from "./ansi.js";
+import { createStyle, fitToWidth, spinnerFrames, splitGraphemes, stripAnsi, terminalSize, truncateAnsi, visibleWidth, wrapAnsiLines } from "./ansi.js";
 import { createTheme } from "./theme.js";
 import { createStreamFormatter } from "./format.js";
 import { Events } from "../lib/events.js";
 
 const MAX_SCROLLBACK_CHARS = 250_000;
 const MAX_INPUT_HISTORY = 200;
+const USER_MESSAGE_ROW = "\u{F0000}";
+const TOOL_SUCCESS_ROW = "\u{F0001}";
+const TOOL_ERROR_ROW = "\u{F0002}";
 const SPINNER_MS = 80;
 const ESCAPE_FLUSH_MS = 25;
 const WHEEL_LINES = 3;
@@ -70,6 +73,9 @@ export class TerminalUI {
     this.wasRaw = Boolean(input.isRaw);
     this.mouseEnabled = false;
     this.pendingInput = "";
+    this.pasting = false;
+    this.pendingPasteCarriageReturn = false;
+    this.inputDecoder = new TextDecoder();
     this.escapeTimer = null;
 
     this.lastFrame = [];
@@ -95,6 +101,7 @@ export class TerminalUI {
     };
     this.handleData = (chunk) => this.consume(chunk);
     this.handleEscapeFlush = () => {
+      if (this.pasting || this.pendingInput !== "\u001b") return;
       this.pendingInput = "";
       this.onKeypress("", { name: "escape", sequence: "\u001b" });
     };
@@ -112,7 +119,7 @@ export class TerminalUI {
     this.started = true;
     // Alternate screen, autowrap off (so a full-width row cannot scroll the
     // screen), hidden cursor, and wheel reporting.
-    this.output.write("\u001b[?1049h\u001b[?7l\u001b[?25l\u001b[?1000h\u001b[?1006h\u001b[2J\u001b[H");
+    this.output.write("\u001b[?1049h\u001b[?7l\u001b[?25l\u001b[?1000h\u001b[?1006h\u001b[?2004h\u001b[2J\u001b[H");
     this.mouseEnabled = true;
     this.lastFrame = [];
     this.lastSize = { columns: 0, rows: 0 };
@@ -213,7 +220,7 @@ export class TerminalUI {
     this.logStream.end();
     this.started = false;
     // Restore autowrap, mouse reporting, the cursor, and the main screen.
-    this.output.write("\u001b[0m\u001b[?25h\u001b[?7h\u001b[?1000l\u001b[?1006l\u001b[?1049l");
+    this.output.write("\u001b[0m\u001b[?25h\u001b[?7h\u001b[?1000l\u001b[?1006l\u001b[?2004l\u001b[?1049l");
   }
 
   [Symbol.asyncIterator]() {
@@ -247,10 +254,24 @@ export class TerminalUI {
     return complete;
   }
 
+  /** Add a padded, full-width user-message surface like OMP's chat transcript. */
+  appendUserMessage(text) {
+    const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+    for (const line of lines) this.transcript += `${USER_MESSAGE_ROW}${line}\n`;
+    if (lines.length) this.transcriptVersion++;
+    this.trimScrollback();
+    if (this.scrollOffset === 0) this.scheduleDraw();
+  }
+
   appendFormatted(text) {
     const lines = this.formatter.push(text);
     if (lines.length) {
-      this.transcript += `${lines.join("\n")}\n`;
+      for (const line of lines) {
+        const plain = stripAnsi(line);
+        if (/^\s*✓/.test(plain)) this.transcript += `${TOOL_SUCCESS_ROW}${line}\n`;
+        else if (/^\s*✗/.test(plain)) this.transcript += `${TOOL_ERROR_ROW}${line}\n`;
+        else this.transcript += `${line}\n`;
+      }
       this.transcriptVersion++;
       this.trimScrollback();
     }
@@ -258,6 +279,11 @@ export class TerminalUI {
     // scrolled back to inspect earlier tool results.
     if (this.scrollOffset === 0) this.scheduleDraw();
     return lines;
+  }
+
+  surfaceRow(text, background, width) {
+    const fitted = fitToWidth(` ${text} `, width);
+    return this.theme.use && this.theme.depth >= 256 ? this.paint.bg(background, fitted) : fitted;
   }
 
   trimScrollback() {
@@ -410,16 +436,20 @@ export class TerminalUI {
   /** Consume raw bytes from the terminal. */
   consume(chunk) {
     if (this.closed) return;
-    const text = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
-    const { events, rest } = decodeKeys(this.pendingInput + text);
+    // Keep the decoder alive across reads: terminals may split a multi-byte
+    // UTF-8 character (or a control sequence) between data events.
+    const text = typeof chunk === "string" ? chunk : this.inputDecoder.decode(chunk, { stream: true });
+    const { events, rest, pasting } = decodeKeys(this.pendingInput + text, { pasting: this.pasting });
     this.pendingInput = rest;
+    this.pasting = pasting;
     if (this.escapeTimer) {
       clearTimeout(this.escapeTimer);
       this.escapeTimer = null;
     }
-    if (this.pendingInput) {
-      // An unfinished escape sequence: wait a moment, then treat a lone ESC as
-      // a keypress rather than swallowing it.
+    // Only a lone ESC is ambiguous with a keypress. Incomplete CSI sequences
+    // and bracketed-paste terminators stay buffered until their next byte, so
+    // SSH/tmux chunk boundaries cannot turn pasted text into keystrokes.
+    if (this.pendingInput === "\u001b" && !this.pasting) {
       this.escapeTimer = setTimeout(this.handleEscapeFlush, ESCAPE_FLUSH_MS);
       this.escapeTimer.unref?.();
     }
@@ -432,11 +462,27 @@ export class TerminalUI {
     const ctrl = Boolean(key.ctrl);
     const shift = Boolean(key.shift);
 
-    if (key.paste) {
-      this.insertText(text);
+    if (name === "paste-start") {
+      this.pendingPasteCarriageReturn = false;
       return;
     }
-    if (name === "paste-start" || name === "paste-end") return;
+    if (name === "paste-end") {
+      this.finishPaste();
+      return;
+    }
+    if (key.paste) {
+      // A chooser is a discrete decision, not a text field: pasted bytes must
+      // never accept or filter a modal choice accidentally.
+      if (this.choice || this.promptState?.keys) return;
+      if (this.selection) {
+        this.selection.query = `${this.selection.query}${String(text).replace(/\r\n?/g, "\n").replace(/\n/g, " ")}`;
+        this.selection.selected = 0;
+        this.draw();
+        return;
+      }
+      this.insertPastedText(text);
+      return;
+    }
 
     if (name === "wheel") {
       this.scrollBy(key.delta ?? (key.direction === "down" ? -WHEEL_LINES : WHEEL_LINES));
@@ -515,7 +561,8 @@ export class TerminalUI {
       return;
     }
     if (name === "backspace") {
-      this.deleteBackward();
+      if (ctrl || key.meta) this.deleteWordBackward();
+      else this.deleteBackward();
       return;
     }
     if (name === "delete") {
@@ -523,13 +570,19 @@ export class TerminalUI {
       return;
     }
     if (name === "left") {
-      this.cursor = Math.max(0, this.cursor - 1);
-      this.draw();
+      if (ctrl || key.meta) this.moveWord(-1);
+      else {
+        this.cursor = Math.max(0, this.cursor - 1);
+        this.draw();
+      }
       return;
     }
     if (name === "right") {
-      this.cursor = Math.min(this.inputChars.length, this.cursor + 1);
-      this.draw();
+      if (ctrl || key.meta) this.moveWord(1);
+      else {
+        this.cursor = Math.min(this.inputChars.length, this.cursor + 1);
+        this.draw();
+      }
       return;
     }
     if (name === "home" || (ctrl && name === "a")) {
@@ -556,19 +609,24 @@ export class TerminalUI {
       this.completeInput();
       return;
     }
+    if (key.meta && name === "b") {
+      this.moveWord(-1);
+      return;
+    }
+    if (key.meta && name === "f") {
+      this.moveWord(1);
+      return;
+    }
     if (ctrl && name === "u") {
-      this.inputChars = this.inputChars.slice(this.cursor);
-      this.cursor = 0;
-      this.draw();
+      this.deleteToLineStart();
+      return;
+    }
+    if (ctrl && name === "k") {
+      this.deleteToLineEnd();
       return;
     }
     if (ctrl && name === "w") {
-      const before = this.inputChars.slice(0, this.cursor).join("");
-      const trimmed = before.replace(/\s*\S+$/, "");
-      const remove = Array.from(before).length - Array.from(trimmed).length;
-      this.inputChars.splice(this.cursor - remove, remove);
-      this.cursor -= remove;
-      this.draw();
+      this.deleteWordBackward();
       return;
     }
     if (text && !ctrl && !key.meta) this.insertText(text);
@@ -612,13 +670,15 @@ export class TerminalUI {
       this.insertText("\n");
       return;
     }
-    if (name === "backspace") return this.deleteBackward();
+    if (name === "backspace") return ctrl || key.meta ? this.deleteWordBackward() : this.deleteBackward();
     if (name === "delete") return this.deleteForward();
     if (name === "left") {
+      if (ctrl || key.meta) return this.moveWord(-1);
       this.cursor = Math.max(0, this.cursor - 1);
       return this.draw();
     }
     if (name === "right") {
+      if (ctrl || key.meta) return this.moveWord(1);
       this.cursor = Math.min(this.inputChars.length, this.cursor + 1);
       return this.draw();
     }
@@ -630,6 +690,11 @@ export class TerminalUI {
       this.cursor = this.inputChars.length;
       return this.draw();
     }
+    if (key.meta && name === "b") return this.moveWord(-1);
+    if (key.meta && name === "f") return this.moveWord(1);
+    if (ctrl && name === "u") return this.deleteToLineStart();
+    if (ctrl && name === "k") return this.deleteToLineEnd();
+    if (ctrl && name === "w") return this.deleteWordBackward();
     if (text && !ctrl && !key.meta) this.insertText(text);
   }
 
@@ -663,7 +728,7 @@ export class TerminalUI {
       return;
     }
     if (name === "backspace") {
-      selection.query = Array.from(selection.query).slice(0, -1).join("");
+      selection.query = splitGraphemes(selection.query).slice(0, -1).join("");
       selection.selected = 0;
       this.draw();
       return;
@@ -714,10 +779,40 @@ export class TerminalUI {
 
   insertText(text) {
     const clean = String(text).replace(/\r\n?/g, "\n");
-    const chars = Array.from(clean);
-    this.inputChars.splice(this.cursor, 0, ...chars);
-    this.cursor += chars.length;
+    if (!clean) return;
+
+    // Only re-segment the graphemes adjacent to the insertion point. This
+    // keeps combining marks/ZWJ emoji intact without rescanning the whole
+    // composer for each typed character or streamed paste chunk.
+    const start = Math.max(0, this.cursor - 1);
+    const end = Math.min(this.inputChars.length, this.cursor + 1);
+    const left = this.inputChars.slice(start, this.cursor).join("");
+    const right = this.inputChars.slice(this.cursor, end).join("");
+    const prefix = left + clean;
+    const local = splitGraphemes(prefix + right);
+    const localCursor = splitGraphemes(prefix).length;
+    if (local.length <= 30_000) {
+      this.inputChars.splice(start, end - start, ...local);
+    } else {
+      this.inputChars = this.inputChars.slice(0, start).concat(local, this.inputChars.slice(end));
+    }
+    this.cursor = start + localCursor;
     this.draw();
+  }
+
+  /** Insert a paste chunk while preserving CRLF when it straddles reads. */
+  insertPastedText(text) {
+    let clean = `${this.pendingPasteCarriageReturn ? "\r" : ""}${String(text ?? "")}`;
+    this.pendingPasteCarriageReturn = clean.endsWith("\r");
+    if (this.pendingPasteCarriageReturn) clean = clean.slice(0, -1);
+    clean = clean.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (clean) this.insertText(clean);
+  }
+
+  finishPaste() {
+    if (!this.pendingPasteCarriageReturn) return;
+    this.pendingPasteCarriageReturn = false;
+    this.insertText("\n");
   }
 
   deleteBackward() {
@@ -733,6 +828,47 @@ export class TerminalUI {
     this.draw();
   }
 
+  moveWord(direction) {
+    let next = this.cursor;
+    if (direction < 0) {
+      while (next > 0 && isWhitespaceGrapheme(this.inputChars[next - 1])) next--;
+      while (next > 0 && !isWhitespaceGrapheme(this.inputChars[next - 1])) next--;
+    } else {
+      while (next < this.inputChars.length && isWhitespaceGrapheme(this.inputChars[next])) next++;
+      while (next < this.inputChars.length && !isWhitespaceGrapheme(this.inputChars[next])) next++;
+    }
+    if (next !== this.cursor) {
+      this.cursor = next;
+      this.draw();
+    }
+  }
+
+  deleteWordBackward() {
+    let start = this.cursor;
+    while (start > 0 && isWhitespaceGrapheme(this.inputChars[start - 1])) start--;
+    while (start > 0 && !isWhitespaceGrapheme(this.inputChars[start - 1])) start--;
+    if (start === this.cursor) return;
+    this.inputChars.splice(start, this.cursor - start);
+    this.cursor = start;
+    this.draw();
+  }
+
+  deleteToLineStart() {
+    const start = this.inputChars.lastIndexOf("\n", this.cursor - 1) + 1;
+    if (start === this.cursor) return;
+    this.inputChars.splice(start, this.cursor - start);
+    this.cursor = start;
+    this.draw();
+  }
+
+  deleteToLineEnd() {
+    const end = this.inputChars.indexOf("\n", this.cursor);
+    const stop = end < 0 ? this.inputChars.length : end;
+    if (stop === this.cursor) return;
+    this.inputChars.splice(this.cursor, stop - this.cursor);
+    this.draw();
+  }
+
   submitInput() {
     const line = this.inputChars.join("");
     if (!line.trim()) {
@@ -741,7 +877,7 @@ export class TerminalUI {
       this.draw();
       return;
     }
-    this.appendVerbatim(`${this.theme.user("›")} ${line}\n`);
+    this.appendUserMessage(line);
     this.history.push(line);
     if (this.history.length > MAX_INPUT_HISTORY) this.history.shift();
     this.historyIndex = this.history.length;
@@ -764,7 +900,7 @@ export class TerminalUI {
       this.historyIndex = Math.min(this.history.length, this.historyIndex + 1);
     }
     const value = this.historyIndex === this.history.length ? this.historyDraft : this.history[this.historyIndex];
-    this.inputChars = Array.from(value ?? "");
+    this.inputChars = splitGraphemes(value ?? "");
     this.cursor = this.inputChars.length;
     this.draw();
   }
@@ -795,7 +931,7 @@ export class TerminalUI {
       if (!matches.length) return;
       const next = matches.length === 1 ? `${matches[0]} ` : commonPrefix(matches);
       if (next) {
-        this.inputChars = Array.from(next);
+        this.inputChars = splitGraphemes(next);
         this.cursor = this.inputChars.length;
         this.draw();
       }
@@ -813,26 +949,27 @@ export class TerminalUI {
 
   // ---------------------------------------------------------------- rendering
 
-  /** Geometry for the current terminal size. Single source of truth. */
+  /** Geometry for the OMP-style transcript, ruled composer, and footer. */
   layout() {
     const { columns, rows } = terminalSize(this.output);
     const width = Math.max(24, Math.floor(columns || 80));
-    // The frame may be taller than a very short pane; `draw` clips it, so the
-    // layout itself only needs a floor of one row.
     const height = Math.max(1, Math.floor(rows || 24));
-    const inner = Math.max(1, width - 4);
-    const composerRows = this.clampComposer(height);
+    const inner = Math.max(1, width - 2);
+    const composerRows = this.choice ? 0 : this.clampComposer(height);
     const choiceRows = this.choice ? this.clampChoice(height) : 0;
-    // 6 rows of chrome: title, status, divider, divider, hint, bottom border.
-    const bodyRows = Math.max(1, height - 6 - (this.choice ? choiceRows : composerRows));
-    const wrapped = this.wrappedLines(inner);
+    const activityRows = this.activity.state === "ready" ? 0 : 1;
+    const inputRows = this.choice ? choiceRows : composerRows;
+    // Full-width composer rules, one activity row while running, and one footer.
+    const bodyRows = Math.max(1, height - 3 - inputRows - activityRows);
+    const wrapped = this.wrappedLines(width);
     const maxScroll = Math.max(0, wrapped.length - bodyRows);
-    return { width, height, inner, composerRows, choiceRows, bodyRows, maxScroll, wrapped };
+    return { width, height, inner, composerRows, choiceRows, activityRows, bodyRows, maxScroll, wrapped };
   }
 
   clampComposer(height) {
-    const limit = Math.max(1, Math.min(MAX_COMPOSER_ROWS, height - 11));
-    return Math.max(1, Math.min(limit, this.wrapComposer(Math.max(1, (terminalSize(this.output).columns || 80) - 4)).length));
+    const limit = Math.max(1, Math.min(MAX_COMPOSER_ROWS, height - 5));
+    const width = Math.max(1, (terminalSize(this.output).columns || 80) - 2);
+    return Math.max(1, Math.min(limit, this.wrapComposer(width).length));
   }
 
   clampChoice(height) {
@@ -846,19 +983,36 @@ export class TerminalUI {
   }
 
   composerPrefix() {
-    if (this.promptState) return this.promptState.label || "› ";
-    return `${this.theme.user("›")} `;
+    return this.promptState ? this.promptState.label || "" : "";
   }
 
   cachedLines(width) {
     if (this.wrapCache.version === this.transcriptVersion && this.wrapCache.width === width) return this.wrapCache.lines;
     const lines = [];
-    for (const line of this.transcript.split("\n")) {
-      if (!line) {
+    for (const stored of this.transcript.split("\n")) {
+      let marker = "";
+      let background = null;
+      if (stored.startsWith(USER_MESSAGE_ROW)) {
+        marker = USER_MESSAGE_ROW;
+        background = "userBg";
+      } else if (stored.startsWith(TOOL_SUCCESS_ROW)) {
+        marker = TOOL_SUCCESS_ROW;
+        background = "toolSuccessBg";
+      } else if (stored.startsWith(TOOL_ERROR_ROW)) {
+        marker = TOOL_ERROR_ROW;
+        background = "toolErrorBg";
+      }
+      if (marker) {
+        const raw = stored.slice(marker.length);
+        const wrapped = raw ? wrapAnsiLines(raw, Math.max(1, width - 2)) : [""];
+        for (const part of wrapped) lines.push(this.surfaceRow(part, background, width));
+        continue;
+      }
+      if (!stored) {
         lines.push("");
         continue;
       }
-      for (const part of wrapAnsiLines(line, width)) lines.push(part);
+      for (const part of wrapAnsiLines(stored, width)) lines.push(part);
     }
     // A trailing newline yields a final empty element; keep it, it is a blank row.
     this.wrapCache = { version: this.transcriptVersion, width, lines };
@@ -882,87 +1036,97 @@ export class TerminalUI {
   }
 
   render() {
-    const { width, height, inner, composerRows, choiceRows, bodyRows } = this.layout();
+    const { width, height, inner, composerRows, choiceRows, activityRows, bodyRows } = this.layout();
     const lines = [];
+    const composerFocused = (!this.paused || Boolean(this.promptState)) && !this.choice;
+    const body = this.selection ? this.renderSelection(bodyRows, width) : this.bodyLines(width, bodyRows);
+    const hasTranscript = Boolean(this.transcript || this.formatter.pending());
+    const filled = this.selection || hasTranscript ? body : this.renderEmpty(bodyRows);
+    for (const line of filled.slice(-bodyRows)) lines.push(fitToWidth(line, width));
+    while (lines.length < bodyRows) lines.push("");
 
-    lines.push(this.titleBar(width));
-    lines.push(this.statusRow(width));
-    lines.push(this.divider(width));
-
-    const body = this.selection ? this.renderSelection(bodyRows, inner) : this.bodyLines(inner, bodyRows);
-    const filled = body && body.length ? body : this.renderEmpty(bodyRows);
-    for (const line of filled.slice(-bodyRows)) lines.push(this.panel(line, width));
-    while (lines.length < 3 + bodyRows) lines.push(this.panel("", width));
-
-    lines.push(this.divider(width));
+    if (activityRows) lines.push(this.activityLine(width));
+    lines.push(this.divider(width, composerFocused));
 
     let cursor = { row: 1, col: 1, visible: false };
     if (this.choice) {
-      const rows = this.renderChoice(choiceRows);
-      for (const row of rows) lines.push(this.panel(row, width));
-      while (lines.length < height - 2) lines.push(this.panel("", width));
+      for (const row of this.renderChoice(choiceRows, width)) lines.push(row);
     } else {
       const content = this.wrapComposer(inner);
       const cursorPos = cursorInComposer(this.inputChars, this.cursor, inner, this.composerPrefix());
       const start = Math.max(0, Math.min(content.length - composerRows, cursorPos.row - composerRows + 1));
       const visible = content.slice(start, start + composerRows);
       while (visible.length < composerRows) visible.push("");
-      for (const row of visible) lines.push(this.panel(row, width));
+      const composerStart = lines.length + 1;
+      for (const row of visible) lines.push(fitToWidth(` ${row} `, width));
       cursor = {
-        row: Math.max(1, Math.min(height, 5 + bodyRows + (cursorPos.row - start))),
-        col: Math.max(1, Math.min(width, cursorPos.col + 3)),
+        row: Math.max(1, Math.min(height, composerStart + cursorPos.row - start)),
+        col: Math.max(1, Math.min(width, cursorPos.col + 1)),
         visible: !this.paused || Boolean(this.promptState),
       };
     }
 
-    lines.push(this.panel(this.hintLine(), width));
-    lines.push(this.borderRow("╰", "╯", width));
-    while (lines.length < height) lines.splice(lines.length - 2, 0, this.panel("", width));
-    if (lines.length > height) lines.splice(3, lines.length - height);
+    lines.push(this.divider(width, composerFocused));
+    lines.push(this.statusRow(width));
+    if (lines.length < height) lines.unshift(...Array(height - lines.length).fill(""));
+    if (lines.length > height) lines.splice(0, Math.min(bodyRows, lines.length - height));
     this.cursorCell = cursor;
     return lines.slice(0, height).map((line) => fitToWidth(line, width));
   }
 
-  titleBar(width) {
-    const left = `${this.theme.bold("zeke")} ${this.theme.faint(this.header.version ?? "v0.1.0")}`;
-    const profile = this.header.profile ? this.theme.muted(` · ${this.header.profile}`) : "";
-    const right = `${this.theme.accent(this.header.model ?? "no model")}${profile}`;
-    return this.borderRow("╭", "╮", width, left, right);
-  }
-
   statusRow(width) {
-    const { state, label, detail, startedAt } = this.activity;
-    const glyph = state === "ready" ? this.theme.ok("●") : this.spinnerGlyph(state);
-    const elapsed = startedAt && state !== "ready" ? this.theme.faint(` ${formatElapsed(Date.now() - startedAt)}`) : "";
-    const name = {
-      ready: this.theme.muted(label),
-      busy: this.theme.accent(label),
-      streaming: this.theme.accent(label),
-      tool: this.theme.tool(label),
-      error: this.theme.err(label),
-    }[state] ?? this.theme.muted(label);
-    const detailText = detail ? this.theme.faint(` ${truncateAnsi(detail, Math.max(8, Math.floor(width / 3)))}`) : "";
-    const left = `${glyph} ${name}${detailText}${elapsed}`;
-    return this.panel(spread(width - 4, left, this.statusRight()), width);
+    const model = this.paint.color("statusModel", this.header.model ?? "no model");
+    const left = [`${this.theme.accent2("π")} ${model}`];
+    if (this.header.profile) left.push(this.theme.accent2(`· ${String(this.header.profile)}`));
+    if (this.header.cwd) left.push(this.paint.color("statusPath", `📁 ${shorten(String(this.header.cwd), Math.max(10, Math.floor(width / 3)))}`));
+
+    const right = this.statusRightParts();
+    const join = (parts) => parts.join(this.theme.faint("  "));
+    let leftText = join(left);
+    let rightText = join(right);
+    while (right.length && visibleWidth(leftText) + visibleWidth(rightText) + 2 > width) {
+      right.pop();
+      rightText = join(right);
+    }
+    while (left.length > 2 && visibleWidth(leftText) + visibleWidth(rightText) + 2 > width) {
+      left.pop();
+      leftText = join(left);
+    }
+    if (visibleWidth(leftText) + visibleWidth(rightText) + 2 > width) {
+      leftText = truncateAnsi(leftText, Math.max(1, width - visibleWidth(rightText) - 1));
+    }
+    return spread(width, leftText, rightText);
   }
 
-  statusRight() {
+  statusRightParts() {
     const parts = [];
     const usage = this.header.context;
     if (usage !== undefined && usage !== null) {
-      const percent = Number.parseFloat(String(usage));
-      parts.push(Number.isFinite(percent) ? `${this.meterBar(percent)} ${this.theme.muted(`${Math.round(percent)}%`)}` : this.theme.muted(String(usage)));
+      const detailed = typeof usage === "object" ? usage : null;
+      const percent = detailed ? Number(detailed.percent) : Number.parseFloat(String(usage));
+      const tokenCount = detailed ? Number(detailed.tokens) : Number.NaN;
+      const tokenLimit = detailed ? Number(detailed.limit) : Number.NaN;
+      if (Number.isFinite(tokenCount) && Number.isFinite(tokenLimit)) {
+        const percentText = Number.isFinite(percent) ? ` ${Math.round(percent)}%/${compactTokens(tokenLimit)}` : `/${compactTokens(tokenLimit)}`;
+        parts.push(this.theme.muted(`▦ ${compactTokens(tokenCount)}${percentText}`));
+      } else {
+        parts.push(this.theme.muted(Number.isFinite(percent) ? `${Math.round(percent)}%` : String(usage)));
+      }
     }
     if (this.scrolled) parts.push(this.theme.gold(`▲ ${this.scrollOffset}`));
-    if (this.header.approval) parts.push(this.theme.muted(`approvals ${this.header.approval}`));
+    if (this.header.approval) parts.push(this.theme.faint(`(${this.header.approval})`));
     if (this.header.session) parts.push(this.theme.faint(shorten(String(this.header.session), 18)));
-    return parts.join(this.theme.faint(" · "));
+    return parts;
   }
 
-  meterBar(percent) {
-    const cells = 8;
-    const filled = Math.max(0, Math.min(cells, Math.round((percent / 100) * cells)));
-    return this.theme.meter(percent, `${"▰".repeat(filled)}${"▱".repeat(cells - filled)}`);
+  activityLine(width) {
+    const { state, label, detail } = this.activity;
+    const glyph = state === "error" ? this.theme.err("!") : this.spinnerGlyph(state);
+    const status = state === "error" ? this.theme.err(label) : this.theme.muted("Working…");
+    const clippedDetail = truncateAnsi(detail, Math.max(8, Math.floor(width / 2)));
+    const extra = state === "tool" && detail ? ` · ${this.theme.faint(clippedDetail)}` : "";
+    const interrupt = this.paused ? this.theme.faint(" (Ctrl+C to interrupt)") : "";
+    return fitToWidth(`${glyph} ${status}${extra}${interrupt}`, width);
   }
 
   spinnerGlyph(state) {
@@ -972,49 +1136,24 @@ export class TerminalUI {
     return this.theme.accent(frame);
   }
 
-  /** `│ content │` — the ordinary row inside the frame. */
-  panel(content, width) {
-    const inner = Math.max(0, width - 4);
-    return `${this.theme.border("│")} ${fitToWidth(content, inner)} ${this.theme.border("│")}`;
-  }
-
-  divider(width) {
-    return this.borderRow("├", "┤", width);
-  }
-
-  /** `╭─── left ─── right ───╮`-style row. */
-  borderRow(left, right, width, leftText = "", rightText = "") {
-    const inner = Math.max(0, width - 2);
-    const leftSegment = leftText ? ` ${leftText} ` : "";
-    const rightSegment = rightText ? ` ${rightText} ` : "";
-    let fill = inner - visibleWidth(leftSegment) - visibleWidth(rightSegment);
-    let head = leftSegment;
-    let tail = rightSegment;
-    if (fill < 0) {
-      // Too narrow for both sides: drop the right side, then hard-clip.
-      fill = Math.max(0, inner - visibleWidth(leftSegment));
-      tail = "";
-      if (fill === 0) head = truncateAnsi(leftSegment, inner);
-    }
-    const line = `${head}${"─".repeat(Math.max(0, fill))}${tail}`;
-    return `${this.theme.border(left)}${fitToWidth(line, inner)}${this.theme.border(right)}`;
+  divider(width, focused = false) {
+    const border = focused ? this.theme.borderFocus : this.theme.border;
+    return border("─".repeat(Math.max(0, width)));
   }
 
   renderEmpty(bodyRows) {
-    const model = this.header.model ? ` ${this.theme.muted(this.header.model)}` : "";
     const cwd = this.header.cwd ? this.theme.muted(this.header.cwd) : "this directory";
     const lines = [
       "",
-      `  ${this.theme.bold("zeke")}${model} ${this.theme.faint("is ready in")} ${cwd}`,
+      `  ${this.theme.accent2("π")} ${this.theme.bold("Ready")} ${this.theme.faint("in")} ${cwd}`,
       "",
-      `  ${this.theme.faint("Ask for a change, a fix or an explanation.")}`,
-      `  ${this.theme.faint("/help lists commands · Ctrl+C quits · PageUp or the wheel scrolls")}`,
+      `  ${this.theme.faint("Describe a change, ask a question, or paste code to get started.")}`,
     ];
     while (lines.length < bodyRows) lines.push("");
     return lines.slice(0, bodyRows);
   }
 
-  renderChoice(rows) {
+  renderChoice(rows, width) {
     const choice = this.choice;
     const out = [`${this.theme.warn("?")} ${this.theme.bold(choice.title)}`];
     for (const line of choice.lines) out.push(`  ${line}`);
@@ -1027,7 +1166,7 @@ export class TerminalUI {
     out.push(`  ${keys}`);
     if (choice.footer) out.push(`  ${this.theme.faint(choice.footer)}`);
     while (out.length < rows) out.push("");
-    return out.slice(0, Math.max(1, rows));
+    return out.slice(0, Math.max(1, rows)).map((line) => this.surfaceRow(line, "toolPendingBg", width));
   }
 
   renderSelection(bodyRows, width) {
@@ -1049,17 +1188,6 @@ export class TerminalUI {
     }
     while (lines.length < bodyRows) lines.push("");
     return lines.slice(0, bodyRows).map((line) => truncateAnsi(line, width));
-  }
-
-  hintLine() {
-    if (this.choice) return this.theme.faint("press a key · Esc cancels");
-    if (this.selection) return this.theme.faint("↑/↓ move · type to filter · Enter select · Esc cancel");
-    if (this.promptState) return this.theme.faint("Enter confirm · Esc cancel · Ctrl+J newline");
-    if (this.scrolled) {
-      return `${this.theme.gold(`▲ ${this.scrollOffset} line${this.scrollOffset === 1 ? "" : "s"} above`)} ${this.theme.faint("· Esc or PgDn returns to the bottom · wheel scrolls")}`;
-    }
-    if (this.paused) return this.theme.faint("working — Ctrl+C interrupts · wheel or PgUp/PgDn scrolls · Ctrl+L redraws");
-    return this.theme.faint("Enter send · ↑↓ history · PgUp/PgDn scroll · Ctrl+R sessions · /help");
   }
 
   // ------------------------------------------------------------------ drawing
@@ -1124,6 +1252,10 @@ export class TerminalUI {
   }
 }
 
+function isWhitespaceGrapheme(value) {
+  return /^\s+$/u.test(String(value ?? ""));
+}
+
 /** Left- and right-aligned text inside one row of `width` cells. */
 function spread(width, left, right) {
   const leftWidth = visibleWidth(left);
@@ -1134,10 +1266,11 @@ function spread(width, left, right) {
   return `${left}${gap}${right}`;
 }
 
-function formatElapsed(ms) {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
+function compactTokens(value) {
+  const count = Math.max(0, Math.round(Number(value) || 0));
+  if (count < 1_000) return String(count);
+  if (count < 10_000) return `${(count / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  return `${Math.round(count / 1_000)}k`;
 }
 
 function shorten(text, max) {
@@ -1146,7 +1279,7 @@ function shorten(text, max) {
 
 /** Wrap composer characters. Words are not re-flowed: this is an editor. */
 function wrapInput(chars, width, promptPrefix) {
-  const prefix = String(promptPrefix || "› ");
+  const prefix = String(promptPrefix ?? "");
   const prefixWidth = Math.min(visibleWidth(prefix), Math.max(0, width - 1));
   const continuation = " ".repeat(prefixWidth);
   const lines = [prefix];
@@ -1167,7 +1300,7 @@ function wrapInput(chars, width, promptPrefix) {
 }
 
 function cursorInComposer(chars, cursor, width, promptPrefix) {
-  const prefixWidth = Math.min(visibleWidth(String(promptPrefix || "› ")), Math.max(0, width - 1));
+  const prefixWidth = Math.min(visibleWidth(String(promptPrefix ?? "")), Math.max(0, width - 1));
   let row = 0;
   let col = prefixWidth;
   for (const char of chars.slice(0, cursor)) {
@@ -1240,29 +1373,77 @@ function modifierFlags(value) {
   return { shift: Boolean(code & 1), meta: Boolean(code & 2), ctrl: Boolean(code & 4) };
 }
 
+const PASTE_END = "\u001b[201~";
+
+function heldSuffixLength(text, marker) {
+  const limit = Math.min(text.length, marker.length - 1);
+  for (let length = limit; length > 0; length--) {
+    if (text.endsWith(marker.slice(0, length))) return length;
+  }
+  return 0;
+}
+
 /**
- * Decode a raw terminal byte string into keypress events.
- *
- * Returns `{ events, rest }`: `rest` is an incomplete escape sequence which the
- * caller must keep for the next chunk (an arrow key split across two reads, or
- * the tail of a bracketed paste).
+ * Decode raw terminal bytes into keypress events. `pasting` is returned as
+ * state so callers can safely stream a paste across arbitrarily split reads.
+ * `rest` contains only an incomplete key/paste marker and must be prepended to
+ * the next chunk.
  *
  * @param {string} input
- * @returns {{events: Array<{text: string, key: any}>, rest: string}}
+ * @param {{pasting?: boolean}} [options]
+ * @returns {{events: Array<{text: string, key: any}>, rest: string, pasting: boolean}}
  */
-export function decodeKeys(input) {
+export function decodeKeys(input, options = {}) {
   const events = [];
   let index = 0;
-  let pasting = false;
+  let pasting = Boolean(options.pasting);
 
   const emit = (text, key = {}) => events.push({ text, key: { shift: false, ctrl: false, meta: false, ...key } });
+  const emitPaste = (text) => {
+    if (text) emit(text, { paste: true, name: null, sequence: text });
+  };
 
   while (index < input.length) {
+    if (pasting) {
+      const end = input.indexOf(PASTE_END, index);
+      if (end >= 0) {
+        emitPaste(input.slice(index, end));
+        emit("", { name: "paste-end" });
+        index = end + PASTE_END.length;
+        pasting = false;
+        continue;
+      }
+
+      // A paste-end marker may be split at any byte boundary. Emit all safe
+      // text immediately but keep its possible prefix for the next read.
+      const remaining = input.slice(index);
+      const held = heldSuffixLength(remaining, PASTE_END);
+      emitPaste(remaining.slice(0, remaining.length - held));
+      return { events, rest: remaining.slice(remaining.length - held), pasting };
+    }
+
     const rest = input.slice(index);
     const char = rest[0];
 
     if (char === "\u001b") {
-      if (rest.length === 1) return { events, rest };
+      if (rest.length === 1) return { events, rest, pasting };
+
+      // Legacy X10 mouse reports are six bytes including ESC [ M; recognize
+      // them before the generic CSI parser or their coordinates look like text.
+      if (rest.startsWith("\u001b[M")) {
+        if (rest.length < 6) return { events, rest, pasting };
+        const bytes = [...rest.slice(3, 6)].map((value) => value.charCodeAt(0) - 32);
+        const button = bytes[0] ?? 0;
+        if (button & 64) {
+          const direction = (button & 1) === 0 ? "up" : "down";
+          emit("", { name: "wheel", direction, delta: direction === "up" ? WHEEL_LINES : -WHEEL_LINES, mouse: true });
+        } else {
+          emit("", { name: "mouse", mouse: true, button, x: bytes[1], y: bytes[2] });
+        }
+        index += 6;
+        continue;
+      }
+
       const csi = /^\u001b\[([0-9;?<>]*)([A-Za-z~])/.exec(rest);
       if (csi) {
         const params = csi[1];
@@ -1290,7 +1471,6 @@ export function decodeKeys(input) {
             continue;
           }
           if (code === 201) {
-            pasting = false;
             emit("", { name: "paste-end" });
             index += consumed;
             continue;
@@ -1307,17 +1487,7 @@ export function decodeKeys(input) {
         index += consumed;
         continue;
       }
-      const legacyMouse = /^\u001b\[M([\s\S]{1,3})/.exec(rest);
-      if (legacyMouse) {
-        const bytes = [...legacyMouse[1]].map((value) => value.charCodeAt(0) - 32);
-        const button = bytes[0] ?? 0;
-        if (button & 64) {
-          const direction = (button & 1) === 0 ? "up" : "down";
-          emit("", { name: "wheel", direction, delta: direction === "up" ? WHEEL_LINES : -WHEEL_LINES, mouse: true });
-        }
-        index += legacyMouse[0].length;
-        continue;
-      }
+
       const ss3 = /^\u001bO([A-Za-z0-9])/.exec(rest);
       if (ss3) {
         const name = CSI_KEYS[ss3[1]];
@@ -1325,14 +1495,21 @@ export function decodeKeys(input) {
         index += ss3[0].length;
         continue;
       }
-      const next = rest[1];
-      if (next === "[" || next === "O") {
-        // The head of a bracketed sequence that has not finished arriving.
-        return { events, rest };
-      }
-      if (next >= " ") {
-        emit(next, { name: next, meta: true, sequence: rest.slice(0, 2) });
+
+      const nextCode = rest.codePointAt(1);
+      if (nextCode === 0x7f || nextCode === 0x08) {
+        emit("", { name: "backspace", meta: true, sequence: rest.slice(0, 2) });
         index += 2;
+        continue;
+      }
+      if (nextCode === 0x5b || nextCode === 0x4f) {
+        // The head of a CSI/SS3 sequence that has not finished arriving.
+        return { events, rest, pasting };
+      }
+      if (nextCode !== undefined && nextCode >= 0x20) {
+        const next = String.fromCodePoint(nextCode);
+        emit(next, { name: next, meta: true, sequence: `\u001b${next}` });
+        index += 1 + next.length;
         continue;
       }
       emit("", { name: "escape", sequence: "\u001b" });
@@ -1369,21 +1546,11 @@ export function decodeKeys(input) {
       continue;
     }
 
-    if (pasting) {
-      let run = "";
-      while (index < input.length && !input.startsWith("\u001b[201~", index)) {
-        run += input[index];
-        index += 1;
-      }
-      if (run) events.push({ text: run, key: { paste: true, name: null, shift: false, ctrl: false, meta: false, sequence: run } });
-      continue;
-    }
-
     emit(seqChar, { name: seqChar });
     index += seqChar.length;
   }
 
-  return { events, rest: "" };
+  return { events, rest: "", pasting };
 }
 
 export function createTerminalUI(options) {

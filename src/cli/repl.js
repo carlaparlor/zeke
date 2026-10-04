@@ -84,7 +84,7 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
       tools: runtime.tools?.names().length ?? 0,
       approval: runtime.approvalMode,
       session: runtime.session?.meta.title ?? runtime.session?.id ?? "ephemeral",
-      context: `${usage.percent}%`,
+      context: usage,
       prompt: promptString(),
     });
   }
@@ -511,15 +511,10 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
 
   function banner() {
     const model = runtime.config.model;
-    if (terminalUI) {
-      write("");
-      write(
-        `  ${paint.bold("zeke")} ${paint.dim(`v0.1.0 · ${model} · approvals ${runtime.approvalMode}`)}` +
-          (runtime.session ? paint.dim(` · session ${runtime.session.id}`) : ""),
-      );
-      write("");
-      return;
-    }
+    // The full-screen title/status bars and empty-state panel already carry
+    // this metadata; printing a second startup banner inside the transcript
+    // makes the first screen feel cluttered.
+    if (terminalUI) return;
     write("");
     write(`  ${paint.bold("zeke")} ${paint.dim(`v0.1.0 · ${model} · ${runtime.config.profileName} profile`)}`);
     write(`  ${paint.dim(`${displayPath(cwd)} · ${runtime.tools.names().length} tools · approvals ${runtime.approvalMode}`)}`);

@@ -70,23 +70,30 @@ export const CODES = {
 
 /** Colour specs used by the theme, with a 256-colour and a true-colour form. */
 export const COLOR_SPECS = {
-  accent: { basic: "magenta", c256: 141, rgb: [175, 135, 255] },
-  accent2: { basic: "cyan", c256: 81, rgb: [95, 215, 255] },
+  // Default dark palette is sampled from oh-my-pi's built-in `dark` theme.
+  accent: { basic: "yellow", c256: 214, rgb: [254, 188, 56] },
+  accent2: { basic: "cyan", c256: 33, rgb: [0, 136, 250] },
   text: { basic: null, c256: 253, rgb: [224, 226, 232] },
-  muted: { basic: "gray", c256: 245, rgb: [140, 148, 162] },
-  faint: { basic: "gray", c256: 240, rgb: [96, 103, 116] },
-  border: { basic: "gray", c256: 238, rgb: [76, 82, 94] },
-  borderFocus: { basic: "magenta", c256: 141, rgb: [175, 135, 255] },
-  user: { basic: "magenta", c256: 213, rgb: [255, 145, 220] },
-  tool: { basic: "cyan", c256: 81, rgb: [95, 215, 255] },
-  ok: { basic: "green", c256: 114, rgb: [126, 224, 137] },
-  err: { basic: "red", c256: 203, rgb: [255, 108, 108] },
-  warn: { basic: "yellow", c256: 221, rgb: [255, 214, 102] },
-  info: { basic: "blue", c256: 111, rgb: [120, 175, 255] },
-  code: { basic: "cyan", c256: 152, rgb: [155, 205, 255] },
-  diffAdd: { basic: "green", c256: 114, rgb: [126, 224, 137] },
-  diffDel: { basic: "red", c256: 203, rgb: [255, 108, 108] },
-  gold: { basic: "yellow", c256: 179, rgb: [224, 178, 92] },
+  muted: { basic: "gray", c256: 244, rgb: [119, 125, 136] },
+  faint: { basic: "gray", c256: 241, rgb: [95, 102, 115] },
+  border: { basic: "blue", c256: 31, rgb: [23, 143, 185] },
+  borderFocus: { basic: "cyan", c256: 33, rgb: [0, 136, 250] },
+  user: { basic: null, c256: 253, rgb: [224, 226, 232] },
+  tool: { basic: "cyan", c256: 33, rgb: [0, 136, 250] },
+  ok: { basic: "green", c256: 108, rgb: [137, 210, 129] },
+  err: { basic: "red", c256: 203, rgb: [252, 58, 75] },
+  warn: { basic: "yellow", c256: 220, rgb: [228, 192, 15] },
+  info: { basic: "cyan", c256: 33, rgb: [0, 136, 250] },
+  code: { basic: "magenta", c256: 183, rgb: [229, 193, 255] },
+  diffAdd: { basic: "green", c256: 108, rgb: [137, 210, 129] },
+  diffDel: { basic: "red", c256: 203, rgb: [252, 58, 75] },
+  gold: { basic: "yellow", c256: 214, rgb: [254, 188, 56] },
+  userBg: { c256: 235, rgb: [34, 29, 26] },
+  toolPendingBg: { c256: 235, rgb: [29, 33, 41] },
+  toolSuccessBg: { c256: 234, rgb: [22, 26, 31] },
+  toolErrorBg: { c256: 235, rgb: [41, 29, 29] },
+  statusModel: { basic: "magenta", c256: 175, rgb: [215, 135, 175] },
+  statusPath: { basic: "cyan", c256: 37, rgb: [0, 175, 175] },
 };
 
 let enabled = colorEnabled();
@@ -177,17 +184,56 @@ function isWide(code) {
   );
 }
 
-function charWidth(char) {
+const graphemeSegmenter = typeof Intl.Segmenter === "function" ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
+const markPattern = /^\p{M}$/u;
+const emojiPresentationPattern = /\p{Emoji_Presentation}/u;
+const emojiPattern = /\p{Emoji}/u;
+
+/** Split text into user-perceived characters, not UTF-16/code-point fragments. */
+export function splitGraphemes(text) {
+  const value = String(text ?? "");
+  if (!value) return [];
+  if (!graphemeSegmenter) return Array.from(value);
+  return Array.from(graphemeSegmenter.segment(value), (part) => part.segment);
+}
+
+function codePointWidth(char) {
   const code = char.codePointAt(0);
-  if (code === 0xfe0f || (code >= 0x0300 && code <= 0x036f)) return 0; // variation selectors, combining marks
+  if (
+    code === 0x200c || // zero-width non-joiner
+    code === 0x200d || // zero-width joiner
+    (code >= 0xfe00 && code <= 0xfe0f) || // variation selectors
+    (code >= 0xe0100 && code <= 0xe01ef) ||
+    (code >= 0x1f3fb && code <= 0x1f3ff) || // emoji skin-tone modifiers
+    markPattern.test(char)
+  ) {
+    return 0;
+  }
   return isWide(code) ? 2 : 1;
 }
 
-/** Visible width of a string, ignoring escapes and counting emoji as 2. */
+/** Width of one grapheme cluster in terminal cells. */
+function graphemeWidth(grapheme) {
+  const chars = Array.from(grapheme);
+  if (!chars.length) return 0;
+  const codepoints = chars.map((char) => char.codePointAt(0));
+  const regionalIndicators = codepoints.filter((code) => code >= 0x1f1e6 && code <= 0x1f1ff).length;
+  const hasKeycap = codepoints.includes(0x20e3);
+  const hasEmojiPresentation = emojiPresentationPattern.test(grapheme);
+  const hasEmojiVariation = codepoints.includes(0xfe0f) && emojiPattern.test(grapheme);
+  const isEmojiJoinerSequence = codepoints.includes(0x200d) && emojiPattern.test(grapheme);
+
+  // Flags, keycaps, emoji-presentation symbols and ZWJ emoji sequences occupy
+  // one two-cell glyph, even though they contain several Unicode code points.
+  if (regionalIndicators >= 2 || hasKeycap || hasEmojiPresentation || hasEmojiVariation || isEmojiJoinerSequence) return 2;
+  return chars.reduce((sum, char) => sum + codePointWidth(char), 0);
+}
+
+/** Visible width of a string, ignoring escapes and measuring grapheme clusters. */
 export function visibleWidth(text) {
   const plain = stripAnsi(text);
   let width = 0;
-  for (const char of plain) width += charWidth(char);
+  for (const grapheme of splitGraphemes(plain)) width += graphemeWidth(grapheme);
   return width;
 }
 
@@ -196,10 +242,10 @@ export function truncateToWidth(text, maxWidth) {
   if (visibleWidth(plain) <= maxWidth) return plain;
   let out = "";
   let width = 0;
-  for (const char of plain) {
-    const w = charWidth(char);
+  for (const grapheme of splitGraphemes(plain)) {
+    const w = graphemeWidth(grapheme);
     if (width + w > maxWidth - 1) break;
-    out += char;
+    out += grapheme;
     width += w;
   }
   return `${out}…`;
@@ -297,9 +343,22 @@ function tokenizeAnsi(line) {
       index += match[0].length;
       continue;
     }
-    const char = String.fromCodePoint(rest.codePointAt(0));
-    units.push({ char, width: charWidth(char), state });
-    index += char.length;
+
+    // Segment ordinary text in runs so a combining sequence or emoji joined
+    // with ZWJ stays an indivisible wrapping/truncation unit.
+    const escape = line.indexOf("\u001b", index);
+    const end = escape < 0 ? line.length : escape;
+    if (end === index) {
+      // Preserve the old fallback for an unrecognised escape byte.
+      const char = String.fromCodePoint(rest.codePointAt(0));
+      units.push({ char, width: graphemeWidth(char), state });
+      index += char.length;
+      continue;
+    }
+    for (const char of splitGraphemes(line.slice(index, end))) {
+      units.push({ char, width: graphemeWidth(char), state });
+    }
+    index = end;
   }
   return { units, state };
 }

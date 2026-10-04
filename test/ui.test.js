@@ -18,6 +18,7 @@ import {
   truncateAnsi,
   fitToWidth,
   truncateToWidth,
+  splitGraphemes,
   colorDepth,
   colorEnabled,
   setColors,
@@ -65,6 +66,20 @@ describe("ansi", () => {
   test("visibleWidth ignores escape sequences", () => {
     assert.equal(visibleWidth("\u001b[31mabcde\u001b[39m"), 5);
     assert.equal(visibleWidth("plain"), 5);
+  });
+
+  test("emoji and combining sequences are measured and truncated as graphemes", () => {
+    const developerEmoji = "👩🏽‍💻";
+    assert.deepEqual(splitGraphemes(developerEmoji), [developerEmoji]);
+    assert.equal(visibleWidth(developerEmoji), 2, "a joined emoji occupies two cells, not five");
+    assert.equal(visibleWidth("🇺🇸 1️⃣ e\u0301"), 7, "flags, keycaps and combining accents use terminal width");
+
+    const clipped = truncateAnsi(`${developerEmoji}xy`, 3);
+    assert.equal(stripAnsi(clipped), `${developerEmoji}…`, "truncation never splits a visible glyph");
+    assert.equal(visibleWidth(clipped), 3);
+    for (const line of wrapAnsi(`${developerEmoji} plus text`, 6).split("\n")) {
+      assert.ok(visibleWidth(line) <= 6, `overwide grapheme row: ${JSON.stringify(line)}`);
+    }
   });
 
   test("truncateToWidth cuts on visible characters and adds an ellipsis", () => {
@@ -174,7 +189,7 @@ describe("stream formatter", () => {
     assert.deepEqual(formatter.push("## Title"), [], "a partial line is not finished yet");
     assert.match(formatter.pending(), /Title/);
     const [heading] = formatter.push("\n");
-    assert.match(heading, /\u001b\[38;5;141m/, "headings are accented");
+    assert.match(heading, /\u001b\[38;5;214m/, "headings use the OMP dark-theme amber accent");
     const flat = stripAnsi(heading);
     assert.match(flat, /## Title/, "the markdown marks stay visible, faint");
   });
@@ -192,7 +207,7 @@ describe("stream formatter", () => {
     const styled = inline(theme, "a **bold** and `code with **stars**` end");
     assert.match(styled, /\u001b\[1m/, "bold is emitted");
     assert.equal(stripAnsi(styled), "a bold and code with **stars** end");
-    assert.match(styled, /\u001b\[38;5;152mcode with \*\*stars\*\*/, "the code span keeps its literal text");
+    assert.match(styled, /\u001b\[38;5;183mcode with \*\*stars\*\*/, "code spans use the OMP dark-theme lilac");
   });
 
   test("a line that is already coloured is never repainted", () => {

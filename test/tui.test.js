@@ -9,7 +9,7 @@ import { createTerminalUI, decodeKeys } from "../src/ui/tui.js";
 import { EventBus, Events } from "../src/lib/events.js";
 import { stripAnsi, visibleWidth } from "../src/ui/ansi.js";
 
-function fakeTerminal({ columns = 80, rows = 24, color = false } = {}) {
+function fakeTerminal({ columns = 80, rows = 24, color = false, depth } = {}) {
   const chunks = [];
   const output = new Writable({
     write(chunk, _encoding, callback) {
@@ -32,7 +32,7 @@ function fakeTerminal({ columns = 80, rows = 24, color = false } = {}) {
   input.resume = () => {};
   input.pause = () => {};
 
-  const ui = createTerminalUI({ input, output, color });
+  const ui = createTerminalUI({ input, output, color, depth });
   ui.start();
   return {
     ui,
@@ -119,6 +119,23 @@ describe("key decoder", () => {
     assert.equal(events[2].key.name, "paste-end");
   });
 
+  test("paste state and a split end marker survive independent input chunks", () => {
+    const first = decodeKeys("\u001b[200~alpha\r", { pasting: false });
+    assert.equal(first.pasting, true);
+    assert.equal(first.events[0].key.name, "paste-start");
+    assert.equal(first.events[1].text, "alpha\r");
+
+    const second = decodeKeys(`\nbeta\r\n\u001b[20`, { pasting: first.pasting });
+    assert.equal(second.pasting, true);
+    assert.equal(second.rest, "\u001b[20", "possible terminator bytes stay buffered");
+    assert.equal(second.events[0].text, "\nbeta\r\n");
+
+    const third = decodeKeys(`${second.rest}1~!`, { pasting: second.pasting });
+    assert.equal(third.pasting, false);
+    assert.equal(third.events[0].key.name, "paste-end");
+    assert.equal(third.events[1].text, "!");
+  });
+
   test("control characters become named keys, and alt+key stays meta", () => {
     assert.equal(decodeKeys("\u0003").events[0].key.ctrl, true);
     assert.equal(decodeKeys("\u0003").events[0].key.name, "c");
@@ -126,6 +143,10 @@ describe("key decoder", () => {
     assert.equal(decodeKeys("\u000a").events[0].key.ctrl, true);
     assert.equal(decodeKeys("\u007f").events[0].key.name, "backspace");
     assert.equal(decodeKeys("\u001bx").events[0].key.meta, true);
+    const altBackspace = decodeKeys("\u001b\u007f").events[0].key;
+    assert.equal(altBackspace.name, "backspace");
+    assert.equal(altBackspace.meta, true);
+    assert.equal(decodeKeys("\u001b[1;5D").events[0].key.ctrl, true, "Ctrl+Left is a word-navigation key");
   });
 });
 
@@ -136,10 +157,13 @@ describe("full-screen terminal UI", () => {
     terminal.ui.draw();
     assert.match(terminal.raw, /\u001b\[\?1049h/);
     assert.match(terminal.raw, /glm-4\.7/);
-    assert.match(terminal.raw, /session-1/);
-    assert.match(terminal.raw, /Ctrl\+R sessions/);
+    assert.match(terminal.screen(), /Ready in repo/);
+    assert.match(terminal.screen(), /session-1/);
+    assert.doesNotMatch(terminal.screen(), /[╭╮│┤╯]/, "the OMP-style transcript has no enclosing frame");
+    assert.equal(visibleWidth(terminal.ui.render()[20]), 80, "the composer uses a full-width top rule");
     assert.match(terminal.raw, /\u001b\[\?25l/, "the cursor is hidden while the frame is painted");
     assert.match(terminal.raw, /\u001b\[\?1000h\\?|\u001b\[\?1000h/, "wheel reporting is enabled");
+    assert.match(terminal.raw, /\u001b\[\?2004h/, "bracketed paste mode is enabled for the session");
     const cursor = terminal.ui.cursorCell;
     assert.equal(cursor.row, 22, "the composer is the second-to-last row");
     assert.match(terminal.raw, new RegExp(`\\u001b\\[${cursor.row};${cursor.col}H\\u001b\\[\\?25h`));
@@ -150,6 +174,7 @@ describe("full-screen terminal UI", () => {
     assert.match(terminal.raw, /\u001b\[\?25h/);
     assert.match(terminal.raw, /\u001b\[\?7h/, "autowrap is restored");
     assert.match(terminal.raw, /\u001b\[\?1000l/, "wheel reporting is turned off again");
+    assert.match(terminal.raw, /\u001b\[\?2004l/, "bracketed paste mode is restored");
   });
 
   test("repaints only what changed, so the screen does not flicker", () => {
@@ -162,8 +187,8 @@ describe("full-screen terminal UI", () => {
     terminal.clear();
     terminal.ui.setActivity("thinking", { state: "busy" });
     terminal.ui.draw();
-    const touched = [...terminal.raw.matchAll(/\u001b\[(\d+);1H/g)].map((match) => Number(match[1]));
-    assert.deepEqual(touched, [2], "only the status row is rewritten");
+    const touched = [...terminal.raw.matchAll(/\u001b\[(\d+);1H\u001b\[2K/g)].map((match) => Number(match[1]));
+    assert.deepEqual(touched, [20], "only the OMP-style activity row is rewritten");
     terminal.ui.destroy();
   });
 
@@ -179,7 +204,34 @@ describe("full-screen terminal UI", () => {
     terminal.key("", { name: "return" });
 
     assert.deepEqual(await pending, { value: "hello", done: false });
-    assert.match(terminal.raw, /› hello/);
+    assert.match(terminal.raw, /hello/);
+    assert.doesNotMatch(terminal.screen(), /› hello/, "submitted prompts are shown as OMP-style message blocks, without a CLI prompt glyph");
+    terminal.ui.destroy();
+  });
+
+  test("uses OMP dark surfaces for submitted user messages", () => {
+    const terminal = fakeTerminal({ color: true, depth: 0x1000000 });
+    terminal.ui.inputChars = Array.from("hello omp");
+    terminal.ui.cursor = terminal.ui.inputChars.length;
+    terminal.key("", { name: "return" });
+    assert.match(terminal.raw, /\u001b\[48;2;34;29;26m/, "user messages use OMP's dark warm surface");
+    assert.match(terminal.screen(), /hello omp/);
+    assert.doesNotMatch(terminal.screen(), /› hello omp/, "the transcript has no input prompt glyph");
+    terminal.output.columns = 40;
+    const resizedMessage = terminal.ui.render().find((row) => stripAnsi(row).includes("hello omp"));
+    assert.equal(visibleWidth(resizedMessage), 40, "the message surface expands to a resized terminal");
+    terminal.ui.destroy();
+  });
+
+  test("renders tool summaries on OMP-style pending and result surfaces", () => {
+    const terminal = fakeTerminal({ color: true, depth: 0x1000000 });
+    terminal.ui.appendOutput("\u001b[32m✓\u001b[39m read file.txt\n");
+    terminal.ui.appendOutput("\u001b[31m✗\u001b[39m bash failed\n");
+    terminal.ui.draw();
+    assert.match(terminal.raw, /\u001b\[48;2;22;26;31m/, "successful tool rows use OMP's dark result surface");
+    assert.match(terminal.raw, /\u001b\[48;2;41;29;29m/, "failed tool rows use OMP's dark error surface");
+    assert.match(terminal.screen(), /read file.txt/);
+    assert.match(terminal.screen(), /bash failed/);
     terminal.ui.destroy();
   });
 
@@ -301,15 +353,16 @@ describe("full-screen terminal UI", () => {
     const terminal = fakeTerminal();
     terminal.ui.setActivity("thinking", { state: "busy" });
     terminal.ui.draw();
-    const first = terminal.screen().split("\n")[1];
-    assert.match(first, /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/, "a spinner frame is on the status row");
+    const first = terminal.screen().split("\n")[19];
+    assert.match(first, /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/, "a spinner frame is shown on the working line");
+    assert.match(first, /Working…/);
     terminal.ui.spinnerFrame = 3;
     terminal.ui.draw();
-    const second = terminal.screen().split("\n")[1];
+    const second = terminal.screen().split("\n")[19];
     assert.notEqual(first, second, "the frame changed");
     terminal.ui.setActivity("Ready", { state: "ready" });
     terminal.ui.draw();
-    assert.match(terminal.screen().split("\n")[1], /● Ready/);
+    assert.equal(terminal.screen().split("\n")[19], "", "the working line disappears when idle");
     terminal.ui.destroy();
   });
 
@@ -419,6 +472,66 @@ describe("full-screen terminal UI", () => {
     terminal.bytes("\u001b[200~line one\nline two\u001b[201~");
     assert.equal(terminal.ui.inputChars.join(""), "line one\nline two");
     assert.equal(terminal.ui.queue.length, 0, "a paste is not a submit");
+    terminal.ui.destroy();
+  });
+
+  test("multi-chunk paste preserves CRLF and a split terminator without submitting", () => {
+    const terminal = fakeTerminal();
+    terminal.bytes("\u001b[200~one\r");
+    terminal.bytes("\ntwo\r");
+    terminal.bytes("\n\u001b[20");
+    assert.equal(terminal.ui.inputChars.join(""), "one\ntwo\n");
+    assert.equal(terminal.ui.pasting, true, "the end marker is still being assembled");
+    terminal.bytes("1~");
+    assert.equal(terminal.ui.pasting, false);
+    assert.equal(terminal.ui.inputChars.join(""), "one\ntwo\n");
+    assert.equal(terminal.ui.queue.length, 0, "paste CR/LF bytes never submit the prompt");
+    terminal.ui.destroy();
+  });
+
+  test("split UTF-8 input and composer editing preserve complete graphemes", () => {
+    const terminal = fakeTerminal();
+    const rocket = Buffer.from("🚀");
+    terminal.bytes(rocket.subarray(0, 2));
+    assert.equal(terminal.ui.inputChars.join(""), "", "an incomplete UTF-8 sequence waits for its remaining bytes");
+    terminal.bytes(rocket.subarray(2));
+    assert.equal(terminal.ui.inputChars.join(""), "🚀");
+    assert.equal(terminal.ui.cursor, 1, "the cursor counts graphemes, not UTF-16 code units");
+    terminal.key("", { name: "backspace" });
+    assert.equal(terminal.ui.inputChars.join(""), "", "Backspace removes the complete emoji");
+    terminal.ui.destroy();
+  });
+
+  test("composer word movement and kill keys operate on the current line", () => {
+    const terminal = fakeTerminal();
+    terminal.ui.inputChars = ["s", "a", "v", "e", " ", "t", "h", "e", " ", "b", "r", "o", "k", "e", "n", " ", "t", "e", "s", "t"];
+    terminal.ui.cursor = terminal.ui.inputChars.length;
+    terminal.key("", { name: "left", ctrl: true });
+    assert.equal(terminal.ui.cursor, 16, "Ctrl+Left stops at the previous word");
+    terminal.key("", { name: "w", ctrl: true });
+    assert.equal(terminal.ui.inputChars.join(""), "save the test");
+
+    terminal.ui.inputChars = ["o", "n", "e", "\n", "t", "w", "o", " ", "x"];
+    terminal.ui.cursor = 6;
+    terminal.key("", { name: "u", ctrl: true });
+    assert.equal(terminal.ui.inputChars.join(""), "one\no x", "Ctrl+U preserves earlier lines");
+    terminal.key("", { name: "k", ctrl: true });
+    assert.equal(terminal.ui.inputChars.join(""), "one\n", "Ctrl+K removes only to this line's end");
+    terminal.ui.destroy();
+  });
+
+  test("status shows token budget and the active composer has its own accent", () => {
+    const terminal = fakeTerminal({ color: true });
+    terminal.ui.setHeader({ context: { tokens: 1534, limit: 128000, percent: 1 } });
+    terminal.ui.draw();
+    assert.match(terminal.screen(), /▦ 1\.5k 1%\/128k/);
+    const active = terminal.ui.divider(80, true);
+    const idle = terminal.ui.divider(80, false);
+    assert.notEqual(active, idle, "the active composer rule is more prominent");
+    const focusedRule = terminal.ui.theme.borderFocus("─".repeat(80));
+    assert.equal(active, focusedRule, "the composer uses the focus role");
+    terminal.ui.pause();
+    assert.notEqual(terminal.ui.render()[20], focusedRule, "paused composer returns to the quiet rule");
     terminal.ui.destroy();
   });
 
