@@ -162,16 +162,20 @@ output, tool activity, approvals and context status together; it restores the te
 leave. Use `--no-tui` to force the scrolling, line-oriented REPL, or when working through a
 terminal wrapper that does not support alternate screens.
 
-The frame is drawn differentially (only changed rows are rewritten, so it does not flicker),
-colour depth is negotiated from the environment (24-bit → 256 → 16, `NO_COLOR` respected), and
-the transcript keeps the colour and markdown decoration the model's output deserves: headings,
-lists, fenced code, inline code and diffs are styled as they stream. A loading spinner with the
-elapsed time sits in the status line while a turn is in flight.
+The transcript and composer follow OMP's minimal terminal layout: unboxed conversation, padded
+user-message surfaces, full-width composer rules, and a compact status bar at the bottom. Rows are
+drawn differentially (only changes are rewritten), colour depth is negotiated from the environment
+(24-bit → 256 → 16, `NO_COLOR` respected), and markdown keeps its decoration as it streams. A live
+working indicator appears above the composer while a turn is in flight.
 
 | Key | Action |
 |---|---|
 | `Enter` | Send the current prompt |
 | `Ctrl+J` | Insert a newline in a multi-line prompt |
+| `Ctrl+A` / `Ctrl+E` | Move to the start/end of the prompt |
+| `Ctrl+←` / `Ctrl+→` (or `Alt+B` / `Alt+F`) | Move by word |
+| `Ctrl+W` / `Alt+Backspace` | Delete the previous word |
+| `Ctrl+U` / `Ctrl+K` | Delete to the start/end of the current line |
 | `↑` / `↓` | Browse prompt history (or move within a multi-line prompt) |
 | `PageUp` / `PageDown`, mouse wheel | Scroll the transcript (works during a turn too) |
 | `Shift+↑` / `Shift+↓` | Scroll half a screen |
@@ -182,8 +186,10 @@ elapsed time sits in the status line while a turn is in flight.
 | `Ctrl+C` | Interrupt a running turn; quit when idle |
 | `Tab` | Complete slash commands |
 
-Pasting is bracketed: a multi-line paste lands in the composer intact instead of submitting at
-the first newline.
+The active composer rule is accented, and the bottom status bar shows context tokens, percent,
+and budget. Bracketed paste is enabled only while the TUI is active: multi-line clipboard content
+lands intact in the composer instead of submitting at the first newline, even when the terminal
+splits the paste across input chunks.
 
 `/resume` opens the session picker; `/resume <id>` still works. `/new` starts a separate saved
 session without discarding the previous transcript. `/clear` resets only the in-memory conversation;
@@ -413,7 +419,7 @@ breaker's `503` + `Retry-After` backoff.
 ## Tests
 
 ```sh
-npm test          # 417 tests in 15 files
+npm test          # 468 tests in 15 files
 npm run selftest  # end-to-end: real CLI against a mock bridge
 zeke selftest     # same suite, from an installed checkout
 ```
