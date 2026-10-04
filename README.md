@@ -179,12 +179,21 @@ working indicator appears above the composer while a turn is in flight.
 | `↑` / `↓` | Browse prompt history (or move within a multi-line prompt) |
 | `PageUp` / `PageDown`, mouse wheel | Scroll the transcript (works during a turn too) |
 | `Shift+↑` / `Shift+↓` | Scroll half a screen |
-| `Esc` | Jump back to the live output after scrolling up |
+| `Esc` | Clear a text selection, or jump back to the live output after scrolling up |
 | `Ctrl+R` | Search and resume a saved session |
 | `Ctrl+N` | Start a distinct session without losing the current one |
 | `Ctrl+L` | Repaint after the terminal has been disturbed |
-| `Ctrl+C` | Interrupt a running turn; quit when idle |
-| `Tab` | Complete slash commands |
+| `Ctrl+C` | Copy the highlighted text; interrupt a running turn when nothing is selected |
+| `Ctrl+Y` | Copy the model's last turn |
+| `Ctrl+T` | Expand or collapse the todo tree above the composer |
+| `Tab` | Accept the highlighted slash command (still completes paths and names) |
+
+**Copying out.** Drag across the transcript to select it — the run is highlighted as you go, and
+releasing the button copies it. Double-click takes a word, triple-click a line. `Ctrl+Y` copies the
+model's last turn, and `/copy [n|last]` copies any turn by number (bare `/copy` asks which one).
+Copies go out as OSC 52 first, which is the transport that survives ssh, tmux and mosh because the
+terminal owns the pasteboard, then fall back to `pbcopy`, `wl-copy`, `xclip` or `clip.exe` in a
+local session. If neither can take it, zeke says so instead of claiming a copy that never happened.
 
 The active composer rule is accented, and the bottom status bar shows context tokens, percent,
 and budget. Bracketed paste is enabled only while the TUI is active: multi-line clipboard content
@@ -213,11 +222,15 @@ Exit codes are meaningful: `0` ok, `1` error, `3` hit `--max-turns`, `130` inter
 |---|---|---|
 | `/help` | `/model` | `/profile` |
 | `/think` | `/verbose` | `/approvals` |
-| `/tools` | `/usage` | `/compact` |
-| `/clear` | `/session` | `/sessions` |
-| `/resume` | `/export` | `/bridge` |
-| `/doctor` | `/plugins` | `/prompt` |
-| `/exit` | | |
+| `/tools` | `/todo` | `/usage` |
+| `/compact` | `/clear` | `/copy` |
+| `/session` | `/sessions` | `/resume` |
+| `/export` | `/bridge` | `/doctor` |
+| `/plugins` | `/prompt` | `/exit` |
+
+Typing `/` previews every command with its one-line description, `↑`/`↓` move the highlight and
+`Tab` accepts it — so the list is discoverable without `/help`. `/todo` prints the todo tree and
+pins it open; `/copy` copies a transcript turn (`/copy last`, or `/copy 3`).
 
 `/bridge` is the same lifecycle tool as `zeke bridge …`, reachable from where the failure
 appears: `/bridge start`, `/bridge restart`, `/bridge stop`, `/bridge logs`, `/bridge models`. When
@@ -278,6 +291,24 @@ exploration is not progress you can tick off.
   "remindersMax": 3,     // completion nudges per user turn
   "eager": "preferred"   // default (off) | preferred (suggest) | always (insist)
 }
+```
+
+**The todo tree.** The list is drawn as a tree and pinned above the composer, where it cannot be
+scrolled away: phases in roman numerals, one checkbox per task (`☐` pending, `◐` running, `✔` done,
+`✗` abandoned, `!` blocked), `done/total` per phase, the active phase first. Collapsed it takes five
+rows; `Ctrl+T` opens it up to twelve, and it never takes more than a third of the screen. The footer
+keeps a `☑ done/total` counter even once the panel is gone, and `/todo` prints the same tree into
+the transcript and pins it open. In the line REPL (`--no-tui`) and in headless runs there is no
+panel to pin, so the tree is printed after each `todo` call instead — a piped run still shows the
+plan.
+
+```
+  ▸ Todos  1/5          4 open · 1 blocked · Ctrl+T expand
+  ☐ I. Research                                        1/3
+    ├─ ✔ read the parser
+    ├─ ◐ map the call sites
+    └─ ☐ write a failing test
+    … II. Fix · 2 more tasks
 ```
 
 `eager: "always"` is the same prelude with imperative wording. omp pairs it with a forced

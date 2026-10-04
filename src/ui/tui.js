@@ -14,9 +14,22 @@
 // Non-TTY runs continue to use the line-oriented REPL.
 
 import { Writable } from "node:stream";
-import { createStyle, fitToWidth, spinnerFrames, splitGraphemes, stripAnsi, terminalSize, truncateAnsi, visibleWidth, wrapAnsiLines } from "./ansi.js";
+import {
+  createStyle,
+  fitToWidth,
+  sliceAnsi,
+  spinnerFrames,
+  splitGraphemes,
+  stripAnsi,
+  terminalSize,
+  truncateAnsi,
+  visibleWidth,
+  wrapAnsiLines,
+} from "./ansi.js";
 import { createTheme } from "./theme.js";
 import { createStreamFormatter } from "./format.js";
+import { renderTodoTree, todoCounts } from "./todo-tree.js";
+import { copyToClipboard } from "./clipboard.js";
 import { Events } from "../lib/events.js";
 
 const MAX_SCROLLBACK_CHARS = 250_000;
@@ -28,11 +41,26 @@ const SPINNER_MS = 80;
 const ESCAPE_FLUSH_MS = 25;
 const WHEEL_LINES = 3;
 const MAX_COMPOSER_ROWS = 6;
+/** Rows the sticky todo panel takes when the list is short enough to fit. */
+const MAX_TODO_ROWS = 5;
+const MAX_TODO_ROWS_EXPANDED = 12;
+/** Rows the slash-command palette shows at once. */
+const MAX_PALETTE_ROWS = 6;
+/** A second click inside this window on the same cell is a double click. */
+const DOUBLE_CLICK_MS = 400;
+const INVERSE_ON = "\u001b[7m";
+const INVERSE_OFF = "\u001b[27m";
 
 export class TerminalUI {
-  constructor({ input = process.stdin, output = process.stdout, color, theme, depth, spinner = true, spinnerStyle = "dots" } = {}) {
+  /**
+   * @param {object} [options]
+   * @param {boolean} [options.spawnClipboard] try a native clipboard tool after
+   *   the OSC 52 write; off in tests, where a child process is not the point
+   */
+  constructor({ input = process.stdin, output = process.stdout, color, theme, depth, spinner = true, spinnerStyle = "dots", spawnClipboard = true } = {}) {
     this.input = input;
     this.output = output;
+    this.spawnClipboard = spawnClipboard;
     const wantsColor = color ?? (typeof output?.isTTY === "boolean" ? output.isTTY : true);
     this.theme = theme ?? createTheme({ color: wantsColor, depth });
     this.color = this.theme.use;
@@ -63,6 +91,16 @@ export class TerminalUI {
     this.completer = null;
     this.shortcutHandler = null;
     this.interruptHandler = null;
+    /** @type {Array<{name: string, tasks: any[]}>} the model's todo list, mirrored from `todo.update`. */
+    this.todos = [];
+    this.todoExpanded = false;
+    /** @type {Array<{name: string, args?: string, description?: string}>} slash commands, for the palette. */
+    this.commands = [];
+    /** @type {{anchor: {row: number, col: number}, head: {row: number, col: number}}|null} */
+    this.textSelection = null;
+    this.lastClick = null;
+    /** Where the body sits on screen, so a click can be mapped to a transcript row. */
+    this.viewport = { begin: 0, rows: 0, padTop: 0, droppedBody: 0, width: 0 };
 
     this.queue = [];
     this.waiters = [];
@@ -118,8 +156,11 @@ export class TerminalUI {
     this.input.resume?.();
     this.started = true;
     // Alternate screen, autowrap off (so a full-width row cannot scroll the
-    // screen), hidden cursor, and wheel reporting.
-    this.output.write("\u001b[?1049h\u001b[?7l\u001b[?25l\u001b[?1000h\u001b[?1006h\u001b[?2004h\u001b[2J\u001b[H");
+    // screen), hidden cursor, and mouse reporting. 1002 (press + drag) is
+    // what makes drag-selection possible: with click-only reports the
+    // transcript can never be selected, so it can never be copied from
+    // inside the full-screen UI.
+    this.output.write("\u001b[?1049h\u001b[?7l\u001b[?25l\u001b[?1000h\u001b[?1002h\u001b[?1006h\u001b[?2004h\u001b[2J\u001b[H");
     this.mouseEnabled = true;
     this.lastFrame = [];
     this.lastSize = { columns: 0, rows: 0 };
@@ -146,6 +187,30 @@ export class TerminalUI {
 
   setCompleter(completer) {
     this.completer = typeof completer === "function" ? completer : null;
+  }
+
+  /**
+   * Slash commands the palette offers while the composer starts with `/`.
+   * @param {Array<{name: string, args?: string, description?: string}>} commands
+   */
+  setCommands(commands = []) {
+    this.commands = Array.isArray(commands) ? commands : [];
+    this.scheduleDraw();
+  }
+
+  /** The model's current todo list, drawn as a tree above the composer. */
+  setTodos(phases = []) {
+    this.todos = Array.isArray(phases) ? phases : [];
+    this.scheduleDraw();
+  }
+
+  /** Pin the list open — what `/todo` does, so the tree outlives the scroll. */
+  showTodos(phases = []) {
+    this.setTodos(phases);
+    if (this.todos.length) {
+      this.todoExpanded = true;
+      this.draw();
+    }
   }
 
   setShortcutHandler(handler) {
@@ -182,6 +247,9 @@ export class TerminalUI {
       if (stopped && stopped !== "complete") this.setActivity(`stopped · ${stopped}`, { state: "error" });
       else this.setActivity("Ready", { state: "ready" });
     });
+    // The tool owns the list; the panel mirrors it, so `/todo`, the sticky tree
+    // and the status counter can never disagree about what is left.
+    listen(Events.TODO_UPDATE, (data) => this.setTodos(data?.phases ?? []));
     return () => {
       for (const unsubscribe of this.unsubscribers.splice(0)) unsubscribe();
     };
@@ -220,7 +288,7 @@ export class TerminalUI {
     this.logStream.end();
     this.started = false;
     // Restore autowrap, mouse reporting, the cursor, and the main screen.
-    this.output.write("\u001b[0m\u001b[?25h\u001b[?7h\u001b[?1000l\u001b[?1006l\u001b[?2004l\u001b[?1049l");
+    this.output.write("\u001b[0m\u001b[?25h\u001b[?7h\u001b[?1000l\u001b[?1002l\u001b[?1006l\u001b[?2004l\u001b[?1049l");
   }
 
   [Symbol.asyncIterator]() {
@@ -488,6 +556,10 @@ export class TerminalUI {
       this.scrollBy(key.delta ?? (key.direction === "down" ? -WHEEL_LINES : WHEEL_LINES));
       return;
     }
+    if (name === "mouse" && key.mouse) {
+      this.handleMouse(key);
+      return;
+    }
 
     if (this.choice) {
       this.handleChoiceKey(text, key);
@@ -503,8 +575,25 @@ export class TerminalUI {
     }
 
     if (ctrl && name === "c") {
+      // A highlighted transcript means "copy this", not "stop": that is what
+      // Ctrl+C means in every other full-screen program that owns the mouse.
+      if (this.textSelection) {
+        void this.copySelection();
+        return;
+      }
       if (this.interruptHandler) this.interruptHandler();
       else this.close();
+      return;
+    }
+    if (ctrl && name === "y") {
+      void this.copyLastTurn();
+      return;
+    }
+    if (ctrl && name === "t") {
+      if (this.todos.length) {
+        this.todoExpanded = !this.todoExpanded;
+        this.draw();
+      }
       return;
     }
     if (ctrl && name === "d") {
@@ -546,7 +635,8 @@ export class TerminalUI {
       return;
     }
     if (name === "escape") {
-      this.scrollToBottom();
+      if (this.textSelection) this.clearTextSelection();
+      else this.scrollToBottom();
       return;
     }
 
@@ -595,6 +685,8 @@ export class TerminalUI {
       this.draw();
       return;
     }
+    if (name === "up" && this.movePalette(-1)) return;
+    if (name === "down" && this.movePalette(1)) return;
     if (name === "up") {
       if (this.inputChars.includes("\n")) this.moveCursorVertical(-1);
       else this.navigateHistory(-1);
@@ -606,6 +698,7 @@ export class TerminalUI {
       return;
     }
     if (name === "tab") {
+      if (this.acceptPalette()) return;
       this.completeInput();
       return;
     }
@@ -924,6 +1017,33 @@ export class TerminalUI {
     this.draw();
   }
 
+  /**
+   * Move the slash-command palette's highlight.
+   * @param {number} direction
+   * @returns {boolean} true when the palette took the key
+   */
+  movePalette(direction) {
+    const matches = this.paletteMatches();
+    if (!matches.length) return false;
+    const index = Math.max(0, Math.min(this.paletteIndex ?? 0, matches.length - 1));
+    this.paletteIndex = Math.max(0, Math.min(matches.length - 1, index + direction));
+    this.draw();
+    return true;
+  }
+
+  /** Tab: take the highlighted command. Completing is never destructive. */
+  acceptPalette() {
+    const matches = this.paletteMatches();
+    if (!matches.length) return false;
+    const command = matches[Math.max(0, Math.min(this.paletteIndex ?? 0, matches.length - 1))];
+    if (!command) return false;
+    const value = `/${command.name} `;
+    this.inputChars = splitGraphemes(value);
+    this.cursor = this.inputChars.length;
+    this.draw();
+    return true;
+  }
+
   completeInput() {
     if (!this.completer) return;
     try {
@@ -947,6 +1067,226 @@ export class TerminalUI {
     return this.selection.options.filter((option) => `${option.label} ${option.description}`.toLowerCase().includes(query));
   }
 
+  // ---------------------------------------------------------- copy & selection
+
+  /**
+   * A terminal cell (1-based, as SGR reports it) as a transcript row and a
+   * visible column. `null` outside the transcript — the composer and the footer
+   * are not selectable.
+   */
+  pointAt(x, y) {
+    const { begin, rows, padTop, droppedBody = 0 } = this.viewport;
+    const position = y - padTop - 1 + droppedBody;
+    if (position < 0 || position >= rows) return null;
+    return { row: begin + position, col: Math.max(0, x - 1) };
+  }
+
+  /** The selection, ordered, so painting and copying agree on the direction. */
+  selectionRange() {
+    const pick = this.textSelection;
+    if (!pick) return null;
+    const firstIsBefore =
+      pick.anchor.row < pick.head.row || (pick.anchor.row === pick.head.row && pick.anchor.col <= pick.head.col);
+    const [start, end] = firstIsBefore ? [pick.anchor, pick.head] : [pick.head, pick.anchor];
+    return { startRow: start.row, startCol: start.col, endRow: end.row, endCol: end.col };
+  }
+
+  selectedText() {
+    const range = this.selectionRange();
+    if (!range) return "";
+    const all = this.wrappedLines(this.viewport.width || 80);
+    const out = [];
+    for (let row = range.startRow; row <= range.endRow; row++) {
+      const line = all[row] ?? "";
+      const from = row === range.startRow ? range.startCol : 0;
+      const to = row === range.endRow ? range.endCol : visibleWidth(line);
+      out.push(stripAnsi(sliceAnsi(line, from, to)).replace(/\s+$/, ""));
+    }
+    while (out.length && !out[out.length - 1]) out.pop();
+    return out.join("\n");
+  }
+
+  clearTextSelection() {
+    if (!this.textSelection) return;
+    this.textSelection = null;
+    this.draw();
+  }
+
+  startTextSelection(point) {
+    this.textSelection = { anchor: { ...point }, head: { ...point } };
+    this.draw();
+  }
+
+  extendTextSelection(point) {
+    if (!this.textSelection) return;
+    this.textSelection.head = { ...point };
+    this.draw();
+  }
+
+  /** A double click: the word under the pointer. A third click takes the row. */
+  selectWord(point) {
+    const line = this.wrappedLines(this.viewport.width || 80)[point.row] ?? "";
+    const plain = stripAnsi(line);
+    const index = columnToIndex(plain, point.col);
+    const graphemes = splitGraphemes(plain);
+    const isWord = (value) => /[\p{L}\p{N}_]/u.test(value ?? "");
+    let start = index;
+    let end = index;
+    if (isWord(graphemes[index])) {
+      while (start > 0 && isWord(graphemes[start - 1])) start--;
+      while (end < graphemes.length && isWord(graphemes[end])) end++;
+    } else if (!/\s/u.test(graphemes[index] ?? " ")) {
+      while (start > 0 && !/\s/u.test(graphemes[start - 1])) start--;
+      while (end < graphemes.length && !/\s/u.test(graphemes[end])) end++;
+    }
+    if (end === start) end = start + 1;
+    this.textSelection = {
+      anchor: { row: point.row, col: indexToColumn(plain, start) },
+      head: { row: point.row, col: indexToColumn(plain, end) },
+    };
+    this.draw();
+  }
+
+  selectRow(point) {
+    const line = this.wrappedLines(this.viewport.width || 80)[point.row] ?? "";
+    this.textSelection = { anchor: { row: point.row, col: 0 }, head: { row: point.row, col: visibleWidth(line) } };
+    this.draw();
+  }
+
+  handleMouse(key) {
+    // A picker or a prompt owns the screen: nothing behind it is selectable.
+    if (this.selection || this.choice || this.promptState) return;
+    const button = key.button ?? 0;
+    const drag = (button & 32) !== 0;
+    const which = button & 3;
+    const point = this.pointAt(key.x, key.y);
+
+    if (!point) {
+      // A click outside the transcript releases any highlight rather than
+      // starting a selection nothing can be copied from.
+      if (which === 0 && !drag) this.clearTextSelection();
+      return;
+    }
+    if (which !== 0) {
+      if (which === 2 && !drag && !key.release) this.clearTextSelection();
+      return;
+    }
+    if (key.release) {
+      if (drag) this.extendTextSelection(point);
+      void this.copySelection();
+      return;
+    }
+    if (drag) {
+      this.extendTextSelection(point);
+      return;
+    }
+
+    // Second click in the same place: the word. Third: the whole row.
+    const now = Date.now();
+    const previous = this.lastClick;
+    const repeat = previous && previous.row === point.row && Math.abs(previous.col - point.col) <= 1 && now - previous.at < DOUBLE_CLICK_MS;
+    const count = repeat ? previous.count + 1 : 1;
+    this.lastClick = { row: point.row, col: point.col, at: now, count: count === 3 ? 0 : count };
+    if (count >= 3) return this.selectRow(point);
+    if (count === 2) return this.selectWord(point);
+    this.startTextSelection(point);
+  }
+
+  /**
+   * The transcript as copyable turns, split at each user message: the same
+   * granularity omp's `/copy` picker walks, so "copy what the model just said"
+   * is one keystroke.
+   *
+   * @returns {Array<{label: string, text: string, lines: number, role: "user"|"zeke"}>}
+   */
+  transcriptTurns() {
+    const turns = [];
+    let current = null;
+    for (const row of this.transcript.split("\n")) {
+      const role = row.startsWith(USER_MESSAGE_ROW) ? "user" : "zeke";
+      const text = stripAnsi(row.replace(ROW_MARKERS, ""));
+      if (!text.trim()) continue;
+      // A turn ends where the speaker changes, so "copy the last thing the
+      // model said" is one row range and not the user's question as well.
+      if (!current || current.role !== role) {
+        current = { label: "", text: "", lines: 0, role };
+        turns.push(current);
+      }
+      current.lines += 1;
+      current.text = current.text ? `${current.text}\n${text}` : text;
+      if (!current.label) current.label = `${role === "user" ? "you" : "zeke"}: ${truncateAnsi(text, 56)}`;
+    }
+    return turns.filter((turn) => turn.lines > 0);
+  }
+
+  /** Copy the current selection, if it has anything worth copying. */
+  async copySelection() {
+    const text = this.selectedText();
+    if (!text) {
+      this.clearTextSelection();
+      return false;
+    }
+    const copied = await this.copyText(text);
+    this.draw();
+    return copied;
+  }
+
+  /** Copy the model's most recent turn — `Ctrl+Y`, no picker, no mouse. */
+  async copyLastTurn() {
+    const turns = this.transcriptTurns();
+    const last = [...turns].reverse().find((turn) => turn.role === "zeke") ?? turns[turns.length - 1];
+    if (!last) {
+      this.note("nothing to copy yet");
+      return false;
+    }
+    return this.copyText(last.text);
+  }
+
+  /**
+   * `/copy`: pick a turn with the keyboard and put it on the clipboard. The
+   * mouse is a convenience; this is the path that works on a machine with no
+   * clipboard tool at all, because OSC 52 goes through the terminal.
+   */
+  async openCopyPicker() {
+    const turns = this.transcriptTurns().slice(-9);
+    if (!turns.length) {
+      this.note("nothing to copy yet");
+      return null;
+    }
+    const offset = Math.max(0, this.transcriptTurns().length - turns.length);
+    const picked = await this.select(
+      "Copy which turn?",
+      turns.map((turn, index) => ({
+        label: turn.label,
+        description: `${turn.lines} line${turn.lines === 1 ? "" : "s"}`,
+        value: String(offset + index),
+      })),
+    );
+    if (picked === null || picked === undefined) return null;
+    const turn = this.transcriptTurns()[Number(picked)];
+    if (!turn) return null;
+    return this.copyText(turn.text);
+  }
+
+  /**
+   * Put text on the clipboard and say what happened. A copy that cannot be
+   * delivered says so instead of pretending: silence is the one thing a copy
+   * must never be.
+   *
+   * @param {string} text
+   * @returns {Promise<boolean>}
+   */
+  async copyText(text) {
+    if (!text) return false;
+    const { via } = await copyToClipboard(text, { stream: this.output, spawn: this.spawnClipboard !== false });
+    const lines = text.split("\n").length;
+    const detail = `${lines} line${lines === 1 ? "" : "s"} · ${text.length} char${text.length === 1 ? "" : "s"}`;
+    if (via) this.note(`copied ${detail} · ${via}`);
+    else this.note(`could not reach a clipboard — ${detail} went nowhere`);
+    this.draw();
+    return Boolean(via);
+  }
+
   // ---------------------------------------------------------------- rendering
 
   /** Geometry for the OMP-style transcript, ruled composer, and footer. */
@@ -959,11 +1299,50 @@ export class TerminalUI {
     const choiceRows = this.choice ? this.clampChoice(height) : 0;
     const activityRows = this.activity.state === "ready" ? 0 : 1;
     const inputRows = this.choice ? choiceRows : composerRows;
+    const paletteRows = this.paletteRows(width, height);
+    const todoRows = this.todoRows(height);
     // Full-width composer rules, one activity row while running, and one footer.
-    const bodyRows = Math.max(1, height - 3 - inputRows - activityRows);
+    const bodyRows = Math.max(1, height - 3 - inputRows - activityRows - todoRows - paletteRows);
     const wrapped = this.wrappedLines(width);
     const maxScroll = Math.max(0, wrapped.length - bodyRows);
-    return { width, height, inner, composerRows, choiceRows, activityRows, bodyRows, maxScroll, wrapped };
+    return { width, height, inner, composerRows, choiceRows, activityRows, todoRows, paletteRows, bodyRows, maxScroll, wrapped };
+  }
+
+  /**
+   * Rows the sticky todo panel takes. Zero when the model has no list, so an
+   * idle session keeps every row of transcript it had before.
+   */
+  todoRows(height) {
+    if (!this.todos.length || this.choice || this.selection) return 0;
+    const cap = this.todoExpanded ? MAX_TODO_ROWS_EXPANDED : MAX_TODO_ROWS;
+    // The header plus the tree, and never more than a third of the screen: the
+    // panel is a glance, the transcript is the point.
+    const wanted = 1 + Math.min(cap, renderTodoTree(this.todos, { theme: this.theme, width: 80, maxRows: cap }).lines.length);
+    return Math.max(0, Math.min(wanted, Math.max(0, Math.floor(height / 3))));
+  }
+
+  /** Rows the slash-command palette takes: nothing while the composer is not asking. */
+  paletteRows(width, height) {
+    const matches = this.paletteMatches();
+    if (!matches.length || this.choice || this.selection) return 0;
+    return Math.min(MAX_PALETTE_ROWS, matches.length, Math.max(0, height - 8));
+  }
+
+  /**
+   * Slash commands matching what is being typed, or none when the composer is
+   * not naming one. `/` alone offers every command, which is the discoverable
+   * half: you type one character and the terminal shows you the rest.
+   */
+  paletteMatches() {
+    if (this.paused || this.choice || this.selection || this.promptState) return [];
+    const line = this.inputChars.join("");
+    if (!line.startsWith("/") || /\s/.test(line)) return [];
+    const typed = line.slice(1).toLowerCase();
+    if (typed !== this.paletteQuery) {
+      this.paletteQuery = typed;
+      this.paletteIndex = 0;
+    }
+    return this.commands.filter((command) => command.name.toLowerCase().startsWith(typed));
   }
 
   clampComposer(height) {
@@ -1032,20 +1411,29 @@ export class TerminalUI {
     const offset = Math.min(this.scrollOffset, maxOffset);
     const end = all.length - offset;
     const begin = Math.max(0, end - bodyRows);
+    // Remember where the body sits: mouse selection maps a screen cell back to
+    // a transcript row through this.
+    this.viewport = { ...this.viewport, begin, rows: bodyRows, width: inner };
     return all.slice(begin, end);
   }
 
   render() {
-    const { width, height, inner, composerRows, choiceRows, activityRows, bodyRows } = this.layout();
+    const { width, height, inner, composerRows, choiceRows, activityRows, bodyRows, todoRows, paletteRows } = this.layout();
     const lines = [];
     const composerFocused = (!this.paused || Boolean(this.promptState)) && !this.choice;
     const body = this.selection ? this.renderSelection(bodyRows, width) : this.bodyLines(width, bodyRows);
     const hasTranscript = Boolean(this.transcript || this.formatter.pending());
     const filled = this.selection || hasTranscript ? body : this.renderEmpty(bodyRows);
-    for (const line of filled.slice(-bodyRows)) lines.push(fitToWidth(line, width));
+    // A mouse selection paints over the body it was drawn from, after the rows
+    // are known, so the highlighted run always matches what is on screen.
+    const painted = this.paintSelection(filled.slice(-bodyRows), width);
+    for (const line of painted) lines.push(fitToWidth(line, width));
     while (lines.length < bodyRows) lines.push("");
 
+    if (todoRows) for (const row of this.renderTodoPanel(width, todoRows)) lines.push(fitToWidth(row, width));
+
     if (activityRows) lines.push(this.activityLine(width));
+    if (paletteRows) for (const row of this.renderPalette(width, paletteRows)) lines.push(fitToWidth(row, width));
     lines.push(this.divider(width, composerFocused));
 
     let cursor = { row: 1, col: 1, visible: false };
@@ -1070,8 +1458,15 @@ export class TerminalUI {
 
     lines.push(this.divider(width, composerFocused));
     lines.push(this.statusRow(width));
-    if (lines.length < height) lines.unshift(...Array(height - lines.length).fill(""));
-    if (lines.length > height) lines.splice(0, Math.min(bodyRows, lines.length - height));
+    const padTop = Math.max(0, height - lines.length);
+    if (padTop) lines.unshift(...Array(padTop).fill(""));
+    // Too many rows for the screen: the body gives way first, from its top.
+    const overflow = Math.max(0, lines.length - height);
+    const droppedBody = Math.min(bodyRows, overflow);
+    if (overflow) lines.splice(0, overflow);
+    // Where the body sits on screen, so a click maps back to a transcript row:
+    // rows are written from row 1, and the body may have lost its own top rows.
+    this.viewport = { ...this.viewport, padTop, droppedBody };
     this.cursorCell = cursor;
     return lines.slice(0, height).map((line) => fitToWidth(line, width));
   }
@@ -1114,6 +1509,11 @@ export class TerminalUI {
       } else {
         parts.push(this.theme.muted(Number.isFinite(percent) ? `${Math.round(percent)}%` : String(usage)));
       }
+    }
+    if (this.todos.length) {
+      const counts = todoCounts(this.todos);
+      const done = `${counts.done}/${counts.total}`;
+      parts.push(counts.open ? this.theme.gold(`☑ ${done}`) : this.theme.ok(`☑ ${done}`));
     }
     if (this.scrolled) parts.push(this.theme.gold(`▲ ${this.scrollOffset}`));
     if (this.header.approval) parts.push(this.theme.faint(`(${this.header.approval})`));
@@ -1169,6 +1569,68 @@ export class TerminalUI {
     if (choice.footer) out.push(`  ${this.theme.faint(choice.footer)}`);
     while (out.length < rows) out.push("");
     return out.slice(0, Math.max(1, rows)).map((line) => this.surfaceRow(line, "toolPendingBg", width));
+  }
+
+  /**
+   * The sticky todo tree: a glance at what the model has left, above the
+   * composer where it cannot be scrolled away.
+   */
+  renderTodoPanel(width, rows) {
+    const counts = todoCounts(this.todos);
+    const arrow = this.todoExpanded ? "▾" : "▸";
+    const left = `${this.theme.accent2(arrow)} ${this.theme.bold("Todos")}  ${this.theme.faint(`${counts.done}/${counts.total}`)}`;
+    const parts = [];
+    if (counts.open) parts.push(`${counts.open} open`);
+    if (counts.blocked) parts.push(`${counts.blocked} blocked`);
+    parts.push(this.todoExpanded ? "Ctrl+T collapse" : "Ctrl+T expand");
+    const lines = [`  ${spread(Math.max(8, width - 4), left, this.theme.faint(parts.join(" · ")))}`];
+    const { lines: tree } = renderTodoTree(this.todos, {
+      theme: this.theme,
+      width: Math.max(12, width - 4),
+      maxRows: rows - 1,
+      expanded: this.todoExpanded,
+    });
+    for (const line of tree.slice(0, Math.max(0, rows - 1))) lines.push(`  ${line}`);
+    while (lines.length < rows) lines.push("");
+    return lines;
+  }
+
+  /**
+   * The slash-command palette: what you are typing, what it does, and which one
+   * Tab will accept.
+   */
+  renderPalette(width, rows) {
+    const matches = this.paletteMatches();
+    const index = Math.max(0, Math.min(this.paletteIndex ?? 0, matches.length - 1));
+    const start = Math.max(0, Math.min(index - Math.floor(rows / 2), Math.max(0, matches.length - rows)));
+    const visible = matches.slice(start, start + rows);
+    const lines = [];
+    visible.forEach((command, offset) => {
+      const selected = start + offset === index;
+      const label = `/${command.name}${command.args ? ` ${command.args}` : ""}`;
+      const painted = selected ? this.theme.inverse(` ${label} `) : this.theme.accent(` ${label} `);
+      const description = command.description ? this.theme.faint(command.description) : "";
+      const marker = selected ? this.theme.accent("› ") : "  ";
+      lines.push(`  ${marker}${painted}  ${description}`);
+    });
+    while (lines.length < rows) lines.push("");
+    return lines.slice(0, rows);
+  }
+
+  /** Invert the selected run of each body row, keeping the row's own colour. */
+  paintSelection(rows, width) {
+    if (!this.textSelection || this.selection) return rows;
+    const { begin } = this.viewport;
+    const range = this.selectionRange();
+    if (!range) return rows;
+    return rows.map((line, position) => {
+      const index = begin + position;
+      if (index < range.startRow || index > range.endRow) return line;
+      const from = index === range.startRow ? range.startCol : 0;
+      const to = index === range.endRow ? range.endCol : visibleWidth(line);
+      if (to <= from) return line;
+      return `${sliceAnsi(line, 0, from)}${highlight(sliceAnsi(line, from, to))}${sliceAnsi(line, to)}`;
+    });
   }
 
   renderSelection(bodyRows, width) {
@@ -1252,6 +1714,38 @@ export class TerminalUI {
   get pendingOutput() {
     return Boolean(this.formatter.pending());
   }
+}
+
+/** The private-use row markers the transcript prefixes decorated lines with. */
+/** The private-use row markers, as one code-point range (`u` keeps the surrogates together). */
+const ROW_MARKERS = /^[\u{F0000}-\u{F0002}]/u;
+const RESET = `\u001b[0m`;
+
+/**
+ * Invert a run for the selection. `sliceAnsi` closes with a reset, and a row
+ * can change colour mid-run, so the inverse is re-asserted after every reset —
+ * otherwise the highlight dies at the first colour change.
+ */
+function highlight(slice) {
+  if (!slice) return "";
+  return `${INVERSE_ON}${slice.split(RESET).join(`${RESET}${INVERSE_ON}`)}${RESET}`;
+}
+
+/** Visible column -> grapheme index in `plain`. */
+function columnToIndex(plain, column) {
+  const graphemes = splitGraphemes(plain);
+  let width = 0;
+  for (let index = 0; index < graphemes.length; index++) {
+    const next = width + visibleWidth(graphemes[index]);
+    if (next > column) return index;
+    width = next;
+  }
+  return graphemes.length;
+}
+
+/** Grapheme index -> visible column in `plain`. */
+function indexToColumn(plain, index) {
+  return visibleWidth(splitGraphemes(plain).slice(0, index).join(""));
 }
 
 function isWhitespaceGrapheme(value) {

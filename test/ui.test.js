@@ -18,6 +18,7 @@ import {
   truncateAnsi,
   fitToWidth,
   truncateToWidth,
+  sliceAnsi,
   splitGraphemes,
   colorDepth,
   colorEnabled,
@@ -170,6 +171,18 @@ describe("ansi", () => {
     assert.equal(colorEnabled({ isTTY: true }), false);
     if (saved === undefined) delete process.env.NO_COLOR;
     else process.env.NO_COLOR = saved;
+  });
+
+  test("sliceAnsi keeps the colour that was in effect and closes with a reset", () => {
+    const red = "\u001b[31m";
+    const reset = "\u001b[39m";
+    const text = `${red}hello${reset} world`;
+    assert.equal(sliceAnsi(text, 0, 5), `${red}hello\u001b[0m`, "the SGR before the slice is carried in");
+    assert.equal(sliceAnsi(text, 3, 8), `${red}lo${reset} wo\u001b[0m`, "sequences inside the slice are kept");
+    assert.equal(sliceAnsi(text, 6), `${reset}world\u001b[0m`, "a slice to the end keeps what follows");
+    assert.equal(sliceAnsi("plain", 1, 3), "la\u001b[0m");
+    assert.equal(sliceAnsi("plain", 5, 9), "", "past the end there is nothing");
+    assert.equal(visibleWidth(sliceAnsi(text, 0, 5)), 5, "the slice is as wide as it was asked to be");
   });
 
   test("symbols are single printable characters", () => {
@@ -439,6 +452,47 @@ describe("renderer", () => {
     renderer.dispose();
     assert.match(cap.raw, /\u001b\[\d+m/);
     assert.match(cap.text, /bash/);
+  });
+});
+
+describe("todo card", () => {
+  const phases = [
+    { name: "Research", tasks: [{ content: "read the parser", status: "completed" }, { content: "map the call sites", status: "in_progress" }] },
+  ];
+  const call = { id: "c_todo", name: "todo", arguments: { op: "init", list: [{ name: "Research", items: ["read the parser"] }] } };
+  const result = { content: "planned", details: { op: "init" } };
+
+  test("the list is printed after the call that changed it", () => {
+    const events = new EventBus();
+    const out = capture();
+    createRenderer(events, { stream: out.stream, color: false, spinner: false });
+    events.emit(Events.TOOL_CALL_START, { toolCall: call });
+    events.emit(Events.TODO_UPDATE, { phases });
+    events.emit(Events.TOOL_CALL_END, { toolCall: call, result, durationMs: 12 });
+    const text = out.text;
+    assert.match(text, /✓ todo/, "the call line comes first");
+    assert.ok(text.indexOf("✓ todo") < text.indexOf("I. Research"), "the tree follows the call");
+    assert.match(text, /read the parser/);
+    assert.match(text, /map the call sites/);
+  });
+
+  test("a live status line owns the list, so the stream stays clean", () => {
+    const events = new EventBus();
+    const out = capture();
+    createRenderer(events, { stream: out.stream, color: false, spinner: false, liveActivity: true });
+    events.emit(Events.TODO_UPDATE, { phases });
+    events.emit(Events.TOOL_CALL_END, { toolCall: call, result, durationMs: 12 });
+    assert.doesNotMatch(out.text, /I\. Research/, "the TUI panel shows this, not the transcript");
+  });
+
+  test("headless quiet mode prints no tree", () => {
+    const events = new EventBus();
+    const out = capture();
+    createRenderer(events, { stream: out.stream, color: false, spinner: false, quiet: true });
+    events.emit(Events.TODO_UPDATE, { phases });
+    events.emit(Events.TOOL_CALL_END, { toolCall: call, result, durationMs: 12 });
+    assert.doesNotMatch(out.text, /I\. Research/);
+    assert.doesNotMatch(out.text, /read the parser/);
   });
 });
 

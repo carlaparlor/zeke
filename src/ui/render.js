@@ -9,9 +9,12 @@ import { Events } from "../lib/events.js";
 import { colorEnabled, fitToWidth, spinnerFrames, stripAnsi, SYMBOLS, visibleWidth } from "./ansi.js";
 import { createTheme } from "./theme.js";
 import { formatDuration, indentBlock, summarizeToolCall } from "./format.js";
+import { renderTodoTree } from "./todo-tree.js";
 
 const SPINNER_FRAMES = spinnerFrames("dots");
 const SPINNER_MS = 80;
+/** How many rows a todo list may take in the transcript before it is capped. */
+const TODO_CARD_ROWS = 12;
 
 /**
  * @typedef {object} RendererOptions
@@ -47,6 +50,10 @@ export function createRenderer(events, options = {}) {
   let spinnerLabel = "";
   let inAssistantText = false;
   let toolOutputPending = false;
+  // The todo tool announces changes mid-call; the list is printed once the call
+  // line is on screen so the two read as one block. With a live status line the
+  // TUI draws the tree itself, and printing it here would double it.
+  let todoCardPending = null;
 
   const write = (text) => stream.write(text);
   const line = (text = "") => write(`${text}\n`);
@@ -76,6 +83,17 @@ export function createRenderer(events, options = {}) {
       spinnerTimer = null;
       stream.write("\r\u001b[2K");
     }
+  }
+
+  /** Print the pending todo list, if the todo tool changed one. */
+  function flushTodoCard() {
+    const phases = todoCardPending;
+    todoCardPending = null;
+    if (!phases || !phases.length) return;
+    ensureNotInText();
+    stopSpinner();
+    const { lines } = renderTodoTree(phases, { theme, width: Math.max(24, columns() - 2), maxRows: TODO_CARD_ROWS });
+    for (const text of lines) line(`  ${text}`);
   }
 
   function ensureNotInText() {
@@ -168,6 +186,7 @@ export function createRenderer(events, options = {}) {
         const preview = String(data.result.content).split("\n").slice(0, 12);
         for (const text of preview) line(`    ${colorizeOutput(theme, text.slice(0, 200))}`);
       }
+      flushTodoCard();
       toolOutputPending = false;
     }),
   );
@@ -185,6 +204,13 @@ export function createRenderer(events, options = {}) {
       ensureNotInText();
       stopSpinner();
       line(dim(String(data.text)));
+    }),
+  );
+
+  unsubscribes.push(
+    events.on(Events.TODO_UPDATE, (data) => {
+      if (options.liveActivity || options.quiet) return;
+      todoCardPending = data?.phases ?? [];
     }),
   );
 
@@ -208,6 +234,7 @@ export function createRenderer(events, options = {}) {
     events.on(Events.TURN_END, (data) => {
       ensureNotInText();
       stopSpinner();
+      flushTodoCard();
       if (options.quiet) return;
       const tokens = data.usage ? `${data.usage.inputTokens}↑ ${data.usage.outputTokens}↓` : "";
       line(dim(`${data.turns} turn${data.turns === 1 ? "" : "s"}${tokens ? ` · ${tokens}` : ""}${data.stopped === "complete" ? "" : ` · ${data.stopped}`}`));

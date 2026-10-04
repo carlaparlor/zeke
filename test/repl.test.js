@@ -14,7 +14,7 @@ import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { sandbox } from "./helpers.js";
-import { askOnInterface } from "../src/cli/repl.js";
+import { askOnInterface, commandDescriptions } from "../src/cli/repl.js";
 
 const BIN = path.resolve("bin/zeke.mjs");
 
@@ -261,5 +261,32 @@ describe("repl recovery", () => {
     } finally {
       await box.cleanup();
     }
+  });
+});
+
+describe("slash commands", () => {
+  test("every command is described, and every description is a command", async () => {
+    const source = await readFile(new URL("../src/cli/repl.js", import.meta.url), "utf8");
+    const start = source.indexOf("const commands = {");
+    const end = source.indexOf("// ------------------------------------------------------------------ loop");
+    const handlers = [...source.slice(start, end).matchAll(/^\s{4}([a-z]+):/gm)].map((match) => match[1]);
+    const described = commandDescriptions({ approvalMode: "ask" });
+
+    assert.deepEqual(
+      described.map((command) => command.name).filter((name) => !handlers.includes(name)),
+      [],
+      "a described command must exist",
+    );
+    // `quit` and `q` are one-line aliases of `exit`; they need no row of their own.
+    assert.deepEqual(
+      handlers.filter((name) => !described.some((command) => command.name === name)),
+      ["quit", "q"],
+      "a command with no description is invisible in /help and in the palette",
+    );
+    for (const command of described) {
+      assert.equal(command.usage, `/${command.name}${command.args ? ` ${command.args}` : ""}`, command.name);
+      assert.ok(command.description && command.description.length > 0, command.name);
+    }
+    assert.equal(new Set(described.map((command) => command.name)).size, described.length, "no duplicates");
   });
 });

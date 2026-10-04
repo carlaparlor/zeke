@@ -8,6 +8,8 @@
 //   - an op that produces any error is discarded wholesale, so a retry never
 //     hits "already exists" for the half that did land.
 
+import { Events } from "../lib/events.js";
+
 /** @typedef {"pending"|"in_progress"|"completed"|"abandoned"|"blocked"} TodoStatus */
 /** @typedef {"init"|"start"|"done"|"rm"|"drop"|"block"|"unblock"|"append"|"view"} TodoOperation */
 /** @typedef {{content: string, status: TodoStatus, blocker?: string}} TodoItem */
@@ -520,7 +522,7 @@ export const todoTool = {
     if (!readOnly && !failed) {
       phasesBySession.set(key, clonePhases(updated));
       if (ctx?.state) ctx.state.todos = clonePhases(updated);
-      ctx?.events?.emit?.("todo.update", { sessionId: key, phases: clonePhases(updated), completedTasks });
+      ctx?.events?.emit?.(Events.TODO_UPDATE, { sessionId: key, phases: clonePhases(updated), completedTasks });
     }
 
     const details = { op, phases: clonePhases(effective), storage };

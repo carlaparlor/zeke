@@ -32,7 +32,7 @@ function fakeTerminal({ columns = 80, rows = 24, color = false, depth } = {}) {
   input.resume = () => {};
   input.pause = () => {};
 
-  const ui = createTerminalUI({ input, output, color, depth });
+  const ui = createTerminalUI({ input, output, color, depth, spawnClipboard: false });
   ui.start();
   return {
     ui,
@@ -563,6 +563,240 @@ describe("full-screen terminal UI", () => {
     assert.equal(terminal.ui.busy, false);
     await new Promise((resolve) => setTimeout(resolve, 5));
     assert.equal(terminal.ui.spinnerTimer, null, "no timer is left running when idle");
+    terminal.ui.destroy();
+  });
+});
+
+const TODOS = [
+  { name: "Research", tasks: [{ content: "read the parser", status: "completed" }, { content: "map the call sites", status: "in_progress" }] },
+  { name: "Fix", tasks: [{ content: "patch the handler", status: "pending" }] },
+];
+
+/** Fill the transcript with numbered rows, so a selection has text to copy. */
+function fill(terminal, rows = 4, prefix = "zeke: ") {
+  for (let i = 0; i < rows; i++) terminal.ui.appendVerbatim(`${prefix}row ${i}\n`);
+  terminal.ui.draw();
+}
+
+/** A mouse report, one-based like the terminal sends it. */
+const mouse = (button, x, y, release = false) => `\u001b[<${button};${x};${y}${release ? "m" : "M"}`;
+
+describe("todo panel", () => {
+  test("the tree sits above the composer, and the footer counts what is left", () => {
+    const terminal = fakeTerminal();
+    fill(terminal);
+    terminal.ui.setTodos(TODOS);
+    terminal.ui.draw();
+    const screen = terminal.screen();
+    assert.match(screen, /Todos/);
+    assert.match(screen, /I\. Research/, "phases are numbered");
+    assert.match(screen, /read the parser/);
+    assert.match(screen, /Ctrl\+T expand/, "the panel says how to open it");
+    assert.match(screen, /☑ 1\/3/, "the footer keeps the count when the panel scrolls away");
+
+    terminal.ui.setTodos([]);
+    terminal.ui.draw();
+    assert.doesNotMatch(terminal.screen(), /Todos/);
+    terminal.ui.destroy();
+  });
+
+  test("the panel mirrors the tool's own updates", () => {
+    const terminal = fakeTerminal();
+    const bus = new EventBus();
+    terminal.ui.attachEvents(bus);
+    bus.emit(Events.TODO_UPDATE, { phases: TODOS });
+    terminal.ui.draw();
+    assert.match(terminal.screen(), /I\. Research/);
+    bus.emit(Events.TODO_UPDATE, { phases: [] });
+    terminal.ui.draw();
+    assert.doesNotMatch(terminal.screen(), /I\. Research/);
+    terminal.ui.destroy();
+  });
+
+  test("Ctrl+T expands the list and collapses it again", () => {
+    const terminal = fakeTerminal({ rows: 24 });
+    const many = [
+      { name: "One", tasks: [{ content: "a", status: "pending" }, { content: "b", status: "pending" }] },
+      { name: "Two", tasks: [{ content: "c", status: "pending" }, { content: "d", status: "pending" }] },
+      { name: "Three", tasks: [{ content: "e", status: "pending" }, { content: "f", status: "pending" }] },
+    ];
+    fill(terminal);
+    terminal.ui.setTodos(many);
+    terminal.ui.draw();
+    const collapsed = terminal.screen().split("\n").filter((line) => /I{1,3}\. |\w+$/.test(line));
+    terminal.key("", { name: "t", ctrl: true });
+    terminal.ui.draw();
+    const expandedRows = terminal.ui.todoRows(24);
+    terminal.key("", { name: "t", ctrl: true });
+    terminal.ui.draw();
+    assert.ok(expandedRows > terminal.ui.todoRows(24), `${expandedRows} rows expanded`);
+    assert.equal(terminal.ui.todoExpanded, false);
+    assert.ok(collapsed.length > 0);
+    terminal.ui.destroy();
+  });
+
+  test("the panel never takes more than a third of the screen", () => {
+    const terminal = fakeTerminal({ rows: 9 });
+    terminal.ui.setTodos(TODOS);
+    terminal.ui.draw();
+    assert.ok(terminal.ui.todoRows(9) <= 3, `${terminal.ui.todoRows(9)} rows on a 9-row screen`);
+    terminal.ui.destroy();
+  });
+});
+
+describe("slash palette", () => {
+  const commands = [
+    { name: "todo", description: "show the todo tree" },
+    { name: "tools", description: "list the tools" },
+    { name: "copy", args: "[n|last]", description: "copy a transcript turn" },
+  ];
+
+  test("typing / previews every command with what it does", () => {
+    const terminal = fakeTerminal();
+    terminal.ui.setCommands(commands);
+    terminal.key("/", { name: "/" });
+    terminal.ui.draw();
+    const screen = terminal.screen();
+    assert.match(screen, /\/todo/);
+    assert.match(screen, /show the todo tree/, "the description is the point of a preview");
+    assert.match(screen, /\/copy \[n\|last\]/);
+    terminal.ui.destroy();
+  });
+
+  test("typing filters, arrows move the highlight, Tab accepts", () => {
+    const terminal = fakeTerminal();
+    terminal.ui.setCommands(commands);
+    terminal.key("/", { name: "/" });
+    for (const char of "to") terminal.key(char, {});
+    terminal.ui.draw();
+    assert.match(terminal.screen(), /\/todo/);
+    assert.match(terminal.screen(), /\/tools/);
+    assert.doesNotMatch(terminal.screen(), /copy a transcript turn/, "a filter hides what no longer matches");
+
+    terminal.key("", { name: "down" });
+    terminal.ui.draw();
+    assert.match(terminal.screen(), /›\s*\/tools/, "the highlight follows the arrow");
+
+    terminal.key("", { name: "tab" });
+    assert.equal(terminal.ui.inputChars.join(""), "/tools ", "Tab completes the command");
+    terminal.ui.draw();
+    assert.doesNotMatch(terminal.screen(), /\/todo/, "the palette closes once accepted");
+    terminal.ui.destroy();
+  });
+
+  test("a typed command that is not a slash stays out of the way", () => {
+    const terminal = fakeTerminal();
+    terminal.ui.setCommands(commands);
+    terminal.key("t", {});
+    terminal.key("o", {});
+    terminal.ui.draw();
+    assert.equal(terminal.ui.paletteRows(80, 24), 0);
+    terminal.ui.destroy();
+  });
+});
+
+describe("copying from the screen", () => {
+  test("a drag selects a run of text, and releasing copies it", async () => {
+    const terminal = fakeTerminal();
+    fill(terminal, 4);
+    const top = terminal.ui.viewport.padTop + 1;
+    terminal.bytes(mouse(0, 3, top));
+    terminal.bytes(mouse(32, 9, top + 1));
+    assert.equal(terminal.ui.selectedText(), "ke: row 0\nzeke: ro", "the selection spans both rows");
+    terminal.clear();
+    terminal.bytes(mouse(0, 9, top + 1, true));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(terminal.ui.transcript, /copied 2 lines/, "the copy says what it took");
+    assert.match(terminal.raw, /\u001b\]52;c;/, "OSC 52 is written to the terminal");
+    terminal.ui.destroy();
+  });
+
+  test("a double click takes the word, a third takes the row", () => {
+    const terminal = fakeTerminal();
+    fill(terminal, 2, "");
+    const top = terminal.ui.viewport.padTop + 1;
+    terminal.bytes(mouse(0, 3, top));
+    terminal.bytes(mouse(0, 3, top));
+    assert.equal(terminal.ui.selectedText(), "row", "the word under the pointer");
+    terminal.bytes(mouse(0, 3, top));
+    assert.equal(terminal.ui.selectedText(), "row 0", "the whole row");
+    terminal.ui.destroy();
+  });
+
+  test("Ctrl+C copies the selection instead of interrupting", async () => {
+    const terminal = fakeTerminal();
+    let interrupted = 0;
+    terminal.ui.setInterruptHandler(() => {
+      interrupted += 1;
+    });
+    fill(terminal, 2, "");
+    const top = terminal.ui.viewport.padTop + 1;
+    terminal.bytes(mouse(0, 1, top));
+    terminal.bytes(mouse(32, 5, top));
+    terminal.key("", { name: "c", ctrl: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(interrupted, 0, "a selection wins over the interrupt");
+    assert.match(terminal.ui.transcript, /copied 1 line/);
+
+    // Without a selection, Ctrl+C is the interrupt it has always been.
+    terminal.ui.clearTextSelection();
+    terminal.key("", { name: "c", ctrl: true });
+    assert.equal(interrupted, 1);
+    terminal.ui.destroy();
+  });
+
+  test("Ctrl+Y copies the model's last turn", async () => {
+    const terminal = fakeTerminal();
+    terminal.ui.appendUserMessage("what broke?");
+    fill(terminal, 3, "");
+    terminal.key("", { name: "y", ctrl: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(terminal.ui.transcript, /copied 3 lines/);
+    assert.match(terminal.raw, /\u001b\]52;c;/);
+    terminal.ui.destroy();
+  });
+
+  test("Escape clears the selection before it jumps to the tail", () => {
+    const terminal = fakeTerminal();
+    fill(terminal, 40, "");
+    terminal.ui.scrollBy(4);
+    const top = terminal.ui.viewport.padTop + 1;
+    terminal.bytes(mouse(0, 1, top));
+    terminal.bytes(mouse(32, 4, top));
+    assert.ok(terminal.ui.textSelection);
+    terminal.key("", { name: "escape" });
+    assert.equal(terminal.ui.textSelection, null);
+    assert.equal(terminal.ui.scrollOffset, 4, "the first Escape only clears the highlight");
+    terminal.key("", { name: "escape" });
+    assert.equal(terminal.ui.scrollOffset, 0);
+    terminal.ui.destroy();
+  });
+
+  test("transcriptTurns splits at each user message, so one keystroke copies a turn", () => {
+    const terminal = fakeTerminal();
+    terminal.ui.appendUserMessage("first question");
+    terminal.ui.appendVerbatim("first answer\n");
+    terminal.ui.appendVerbatim("still the first answer\n");
+    terminal.ui.appendUserMessage("second question");
+    terminal.ui.appendVerbatim("second answer\n");
+    const turns = terminal.ui.transcriptTurns();
+    assert.deepEqual(
+      turns.map((turn) => turn.role),
+      ["user", "zeke", "user", "zeke"],
+    );
+    assert.equal(turns[1].lines, 2);
+    assert.equal(turns[1].text, "first answer\nstill the first answer");
+    assert.match(turns[0].label, /^you: first question$/);
+    assert.match(turns[3].label, /^zeke: second answer$/);
+    terminal.ui.destroy();
+  });
+
+  test("a click below the transcript selects nothing", () => {
+    const terminal = fakeTerminal();
+    fill(terminal, 2);
+    const bottom = terminal.ui.viewport.padTop + terminal.ui.viewport.rows + 1;
+    terminal.bytes(mouse(0, 2, bottom));
+    assert.equal(terminal.ui.textSelection, null);
     terminal.ui.destroy();
   });
 });
