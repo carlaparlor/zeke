@@ -2,7 +2,7 @@
 //
 // Output is captured (no PTY), capped, and streamed to the UI as it arrives.
 // Long-running commands are the model's most common way to hang a session, so
-// the timeout is short by default and the kill is unconditional.
+// the timeout is bounded and on POSIX a timeout/interrupt kills the whole process group.
 
 import { spawn } from "node:child_process";
 import { displayPath, isWithin, resolvePath } from "../lib/paths.js";
@@ -24,7 +24,7 @@ const BLOCKED = [
 export const bashTool = {
   name: "bash",
   description:
-    "Run a shell command in the workspace and return its output. Use for builds, tests, git, and real binaries. Never use it to read or edit files — use read/edit/write/grep/glob. Commands that need a terminal (vim, less, top, ssh, sudo) are refused. Default timeout 120s.",
+    "Run a shell command in the workspace and return its output. Use for builds, tests, git, and real binaries. Never use it to read or edit files — use read/edit/write/grep/glob. Commands that need a terminal (vim, less, top, ssh, sudo) are refused. Default timeout 120s; on POSIX, timeout and interrupt kill the whole process group.",
   parameters: {
     type: "object",
     properties: {
@@ -40,6 +40,7 @@ export const bashTool = {
   async execute(args, ctx) {
     const command = String(args.command ?? "").trim();
     if (!command) throw new ToolError("command is empty");
+    if (ctx.signal?.aborted) throw new ToolError("command was cancelled before it started");
 
     for (const pattern of BLOCKED) {
       if (pattern.test(command)) {
@@ -56,6 +57,7 @@ export const bashTool = {
 
     const child = spawn("/bin/bash", ["-lc", command], {
       cwd,
+      detached: process.platform !== "win32",
       env: {
         ...process.env,
         ...(typeof args.env === "object" && args.env ? mapValues(args.env) : {}),
@@ -71,16 +73,19 @@ export const bashTool = {
     let stderr = "";
     let killed = false;
     let timedOut = false;
+    let aborted = false;
+    let exitSignal = null;
 
     const timer = setTimeout(() => {
       timedOut = true;
       killed = true;
-      child.kill("SIGKILL");
+      killCommandTree(child);
     }, timeout);
 
     const onAbort = () => {
+      aborted = true;
       killed = true;
-      child.kill("SIGKILL");
+      killCommandTree(child);
     };
     ctx.signal?.addEventListener("abort", onAbort);
 
@@ -99,13 +104,17 @@ export const bashTool = {
         stderr = capAppend(stderr, `\n${err.message}`);
         resolve(-1);
       });
-      child.on("close", (code) => resolve(code ?? -1));
+      child.on("close", (code, signal) => {
+        exitSignal = signal;
+        resolve(code ?? -1);
+      });
     });
 
     clearTimeout(timer);
     ctx.signal?.removeEventListener("abort", onAbort);
 
-    const parts = [`$ ${command}`, `cwd: ${displayPath(cwd, ctx.cwd)}`, `exit: ${exitCode}${timedOut ? ` (killed after ${timeout} ms)` : ""}`];
+    const exitNote = timedOut ? ` (killed after ${timeout} ms)` : aborted ? " (interrupted)" : exitSignal ? ` (${exitSignal})` : "";
+    const parts = [`$ ${command}`, `cwd: ${displayPath(cwd, ctx.cwd)}`, `exit: ${exitCode}${exitNote}`];
     if (stdout.trim()) parts.push("", "--- stdout ---", truncateOutput(stdout.replace(/\n$/, "")));
     if (stderr.trim()) parts.push("", "--- stderr ---", truncateOutput(stderr.replace(/\n$/, "")));
     if (!stdout.trim() && !stderr.trim()) parts.push("", "(no output)");
@@ -113,12 +122,29 @@ export const bashTool = {
     return {
       content: parts.join("\n"),
       isError: exitCode !== 0,
-      details: { exitCode, timedOut, killed, cwd },
+      details: { exitCode, timedOut, killed, aborted, signal: exitSignal, cwd },
     };
   },
 
   summarize: (args) => String(args.command ?? "").slice(0, 80),
 };
+
+function killCommandTree(child) {
+  if (!child.pid) return;
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch (err) {
+      if (err.code === "ESRCH") return;
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // It may have exited between the timeout and the kill.
+  }
+}
 
 function mapValues(env) {
   const out = {};

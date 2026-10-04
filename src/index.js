@@ -47,7 +47,7 @@ export { parseJsonc, stripJsonc } from "./lib/jsonc.js";
 export { parseToolArguments, repairJson } from "./lib/json-repair.js";
 export { paths, projectSlug, resolvePath, displayPath, isWithin } from "./lib/paths.js";
 
-export { buildSystemPrompt, loadProjectPrompt } from "./prompts/system.js";
+export { buildSystemPrompt, findProjectRoot, loadProjectContext, loadProjectPrompt } from "./prompts/system.js";
 
 export { createPluginApi } from "./plugins/api.js";
 export { loadPlugins, listPlugins } from "./plugins/index.js";
@@ -56,6 +56,7 @@ export { startBridge, stopBridge, restartBridge, health as bridgeHealth, swapTok
 export { buildBridge, ensureVendored, findGo, sourceFingerprint } from "./bridge/build.js";
 
 export { createRenderer } from "./ui/render.js";
+export { TerminalUI, createTerminalUI } from "./ui/tui.js";
 export { startMockBridge, scripted } from "./mock-bridge/server.js";
 
 export { VERSION } from "./cli/main.js";

@@ -16,7 +16,7 @@ const OPERATION_SCHEMA = {
     oldText: {
       type: "string",
       description:
-        "Exact text to act on, copied from a `read` of this file. Include enough surrounding lines to be unique. Required for replace/insert_before/insert_after/delete.",
+        "Exact text to act on, copied from a recent `read`. Include enough surrounding lines to be unique; close fuzzy candidates are refused instead of guessed. Required for replace/insert_before/insert_after/delete.",
     },
     newText: { type: "string", description: "Replacement or inserted text. Required for replace/insert_before/insert_after/create." },
     line: { type: "integer", description: "1-based line number for insert_before/insert_after when oldText is not used." },
@@ -27,7 +27,7 @@ const OPERATION_SCHEMA = {
 export const editTool = {
   name: "edit",
   description:
-    "Edit a file with one or more ordered operations. Prefer this over rewriting a whole file and NEVER over using sed/perl/python through bash. Copy `oldText` verbatim from a recent `read` — the matcher tolerates indentation drift but not invented text. Operations: replace, insert_before, insert_after, delete, create.",
+    "Edit a file with one or more ordered operations. Prefer this over rewriting a whole file and NEVER over using sed/perl/python through bash. Copy `oldText` verbatim from a recent `read` — approximate matching only applies when one location is clearly best, and close candidates are refused. Operations: replace, insert_before, insert_after, delete, create.",
   parameters: {
     type: "object",
     properties: {

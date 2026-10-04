@@ -69,6 +69,7 @@ describe("CLI basics", () => {
     for (const command of ["setup", "bridge", "doctor", "tokens", "config", "models", "tools", "sessions", "plugins", "selftest"]) {
       assert.match(result.stdout, new RegExp(command));
     }
+    assert.match(result.stdout, /--no-tui/);
   });
 
   test("an unknown flag exits 2 with a message", async () => {

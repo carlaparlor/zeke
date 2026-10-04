@@ -200,7 +200,7 @@ export async function runDiagnostics({ config, deep = false }) {
  * @param {{flags: any, config: any}} ctx
  * @returns {Promise<number>}
  */
-export async function doctorCommand({ flags, config }) {
+export async function doctorCommand({ flags, config, output = process.stdout }) {
   const paint = flags.quiet ? plain() : style;
   const checks = await runDiagnostics({ config, deep: !flags["no-deep"] });
 
@@ -210,30 +210,30 @@ export async function doctorCommand({ flags, config }) {
   // Machine-readable output must be parseable on its own: nothing else may be
   // written to stdout when --json is in effect.
   if (flags.json) {
-    process.stdout.write(`${JSON.stringify({ ok: failures.length === 0, failures: failures.length, warnings: warnings.length, checks }, null, 2)}\n`);
+    output.write(`${JSON.stringify({ ok: failures.length === 0, failures: failures.length, warnings: warnings.length, checks }, null, 2)}\n`);
     return failures.length ? 1 : 0;
   }
 
-  process.stdout.write(`${paint.bold("\nzeke doctor")}\n\n`);
+  output.write(`${paint.bold("\nzeke doctor")}\n\n`);
   const width = Math.max(...checks.map((c) => c.name.length));
   for (const check of checks) {
     const icon = { ok: paint.green("✓"), warn: paint.yellow("!"), fail: paint.red("✗") }[check.status];
-    process.stdout.write(`  ${icon} ${check.name.padEnd(width)}  ${check.detail}\n`);
-    if (check.hint) process.stdout.write(`  ${" ".repeat(2)} ${paint.dim(`↳ ${check.hint}`)}\n`);
+    output.write(`  ${icon} ${check.name.padEnd(width)}  ${check.detail}\n`);
+    if (check.hint) output.write(`  ${" ".repeat(2)} ${paint.dim(`↳ ${check.hint}`)}\n`);
   }
 
-  process.stdout.write("\n");
+  output.write("\n");
   if (failures.length) {
-    process.stdout.write(`${paint.red(`${failures.length} failing`)}${warnings.length ? paint.yellow(`, ${warnings.length} warning(s)`) : ""}\n`);
+    output.write(`${paint.red(`${failures.length} failing`)}${warnings.length ? paint.yellow(`, ${warnings.length} warning(s)`) : ""}\n`);
   } else if (warnings.length) {
-    process.stdout.write(`${paint.green("healthy")}${paint.yellow(` with ${warnings.length} warning(s)`)}\n`);
+    output.write(`${paint.green("healthy")}${paint.yellow(` with ${warnings.length} warning(s)`)}\n`);
   } else {
-    process.stdout.write(`${paint.green("everything checks out")}\n`);
+    output.write(`${paint.green("everything checks out")}\n`);
   }
 
   if (flags["logs"]) {
     const tail = await readLogTail();
-    if (tail) process.stdout.write(`\n${paint.dim("--- last bridge log lines ---")}\n${tail}\n`);
+    if (tail) output.write(`\n${paint.dim("--- last bridge log lines ---")}\n${tail}\n`);
   }
 
   return failures.length ? 1 : 0;
