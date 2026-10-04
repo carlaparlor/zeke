@@ -9,9 +9,12 @@ import { Events } from "../lib/events.js";
 import { colorEnabled, fitToWidth, spinnerFrames, stripAnsi, SYMBOLS, visibleWidth } from "./ansi.js";
 import { createTheme } from "./theme.js";
 import { formatDuration, indentBlock, summarizeToolCall } from "./format.js";
+import { renderTodoTree } from "./todo-tree.js";
 
 const SPINNER_FRAMES = spinnerFrames("dots");
 const SPINNER_MS = 80;
+/** How many rows a todo list may take in the transcript before it is capped. */
+const TODO_CARD_ROWS = 12;
 
 /**
  * @typedef {object} RendererOptions
@@ -47,6 +50,10 @@ export function createRenderer(events, options = {}) {
   let spinnerLabel = "";
   let inAssistantText = false;
   let toolOutputPending = false;
+  // The todo tool announces changes mid-call; the list is printed once the call
+  // line is on screen so the two read as one block. With a live status line the
+  // TUI draws the tree itself, and printing it here would double it.
+  let todoCardPending = null;
 
   const write = (text) => stream.write(text);
   const line = (text = "") => write(`${text}\n`);
@@ -76,6 +83,17 @@ export function createRenderer(events, options = {}) {
       spinnerTimer = null;
       stream.write("\r\u001b[2K");
     }
+  }
+
+  /** Print the pending todo list, if the todo tool changed one. */
+  function flushTodoCard() {
+    const phases = todoCardPending;
+    todoCardPending = null;
+    if (!phases || !phases.length) return;
+    ensureNotInText();
+    stopSpinner();
+    const { lines } = renderTodoTree(phases, { theme, width: Math.max(24, columns() - 2), maxRows: TODO_CARD_ROWS });
+    for (const text of lines) line(`  ${text}`);
   }
 
   function ensureNotInText() {
@@ -168,6 +186,7 @@ export function createRenderer(events, options = {}) {
         const preview = String(data.result.content).split("\n").slice(0, 12);
         for (const text of preview) line(`    ${colorizeOutput(theme, text.slice(0, 200))}`);
       }
+      flushTodoCard();
       toolOutputPending = false;
     }),
   );
@@ -189,6 +208,21 @@ export function createRenderer(events, options = {}) {
   );
 
   unsubscribes.push(
+    events.on(Events.TODO_UPDATE, (data) => {
+      if (options.liveActivity || options.quiet) return;
+      todoCardPending = data?.phases ?? [];
+    }),
+  );
+
+  unsubscribes.push(
+    events.on(Events.TODO_REMINDER, (data) => {
+      ensureNotInText();
+      stopSpinner();
+      line(dim(`todo · ${describeReminder(data)}`));
+    }),
+  );
+
+  unsubscribes.push(
     events.on(Events.COMPACT, (data) => {
       ensureNotInText();
       stopSpinner();
@@ -200,6 +234,7 @@ export function createRenderer(events, options = {}) {
     events.on(Events.TURN_END, (data) => {
       ensureNotInText();
       stopSpinner();
+      flushTodoCard();
       if (options.quiet) return;
       const tokens = data.usage ? `${data.usage.inputTokens}↑ ${data.usage.outputTokens}↓` : "";
       line(dim(`${data.turns} turn${data.turns === 1 ? "" : "s"}${tokens ? ` · ${tokens}` : ""}${data.stopped === "complete" ? "" : ` · ${data.stopped}`}`));
@@ -226,6 +261,29 @@ export function createRenderer(events, options = {}) {
       for (const off of unsubscribes) off();
     },
   };
+}
+
+/**
+ * One dim line for a session-level todo nudge, so the transcript shows *why*
+ * the agent suddenly carried on, or why it was asked for a list up front.
+ *
+ * @param {{kind?: string, incomplete?: number, attempt?: number, maxAttempts?: number}} data
+ */
+function describeReminder(data) {
+  const count = data?.incomplete ?? 0;
+  const plural = count === 1 ? "" : "s";
+  switch (data?.kind) {
+    case "eager-todo":
+      return "asked for a phased todo first";
+    case "mid-run":
+      return `${count} item${plural} still open — asked for a todo update`;
+    case "todo-error":
+      return "todo call failed — asked for a corrected call";
+    case "completion":
+      return `${count} item${plural} still open · reminder ${data.attempt}/${data.maxAttempts}`;
+    default:
+      return "reminder";
+  }
 }
 
 /**

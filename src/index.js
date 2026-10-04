@@ -41,6 +41,7 @@ export {
 export { SessionStore } from "./session/store.js";
 export { compact, shouldCompact, extractiveSummary } from "./session/compact.js";
 export { renderTranscript, exportTranscript } from "./session/export.js";
+export { TodoReminders, isAwaitingUserAnswer, TODO_EAGER_MODES } from "./session/todo-reminders.js";
 
 export { EventBus, Events } from "./lib/events.js";
 export { parseJsonc, stripJsonc } from "./lib/jsonc.js";
@@ -56,11 +57,13 @@ export { startBridge, stopBridge, restartBridge, health as bridgeHealth, swapTok
 export { buildBridge, ensureVendored, findGo, sourceFingerprint } from "./bridge/build.js";
 
 export { createRenderer } from "./ui/render.js";
+export { renderTodoTree, todoCounts, TODO_GLYPHS } from "./ui/todo-tree.js";
+export { copyToClipboard, osc52Sequence, nativeClipboardCommand } from "./ui/clipboard.js";
 export { TerminalUI, createTerminalUI, decodeKeys } from "./ui/tui.js";
 export { createApprovalPrompt, describeCall, previewDiff, rememberScope } from "./ui/approve.js";
 export { createTheme, plainTheme, THEME_ROLES } from "./ui/theme.js";
 export { createStreamFormatter, styleLine, inline, summarizeToolCall, formatDuration } from "./ui/format.js";
-export { wrapAnsi, truncateAnsi, fitToWidth, visibleWidth, stripAnsi, colorDepth, spinnerFrames, SPINNER_STYLES } from "./ui/ansi.js";
+export { wrapAnsi, truncateAnsi, fitToWidth, visibleWidth, stripAnsi, sliceAnsi, colorDepth, spinnerFrames, SPINNER_STYLES } from "./ui/ansi.js";
 export { startMockBridge, scripted } from "./mock-bridge/server.js";
 
 export { VERSION } from "./cli/main.js";

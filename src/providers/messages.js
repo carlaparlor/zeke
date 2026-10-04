@@ -112,7 +112,18 @@ function collapseConsecutiveUsers(messages) {
   const out = [];
   for (const message of messages) {
     const prev = out[out.length - 1];
-    if (prev && prev.role === "user" && message.role === "user" && !prev.toolCalls && !message.toolCalls) {
+    // A synthetic message is an injected reminder (todo nudges), not a turn of
+    // conversation: merging it into the user's text would bury the instruction
+    // and lose the marker that keeps it out of the transcript.
+    const mergeable =
+      prev &&
+      prev.role === "user" &&
+      message.role === "user" &&
+      !prev.toolCalls &&
+      !message.toolCalls &&
+      !prev.synthetic &&
+      !message.synthetic;
+    if (mergeable) {
       prev.content = `${prev.content ?? ""}\n\n${message.content ?? ""}`;
       continue;
     }

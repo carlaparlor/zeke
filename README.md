@@ -179,12 +179,21 @@ working indicator appears above the composer while a turn is in flight.
 | `↑` / `↓` | Browse prompt history (or move within a multi-line prompt) |
 | `PageUp` / `PageDown`, mouse wheel | Scroll the transcript (works during a turn too) |
 | `Shift+↑` / `Shift+↓` | Scroll half a screen |
-| `Esc` | Jump back to the live output after scrolling up |
+| `Esc` | Clear a text selection, or jump back to the live output after scrolling up |
 | `Ctrl+R` | Search and resume a saved session |
 | `Ctrl+N` | Start a distinct session without losing the current one |
 | `Ctrl+L` | Repaint after the terminal has been disturbed |
-| `Ctrl+C` | Interrupt a running turn; quit when idle |
-| `Tab` | Complete slash commands |
+| `Ctrl+C` | Copy the highlighted text; interrupt a running turn when nothing is selected |
+| `Ctrl+Y` | Copy the model's last turn |
+| `Ctrl+T` | Expand or collapse the todo tree above the composer |
+| `Tab` | Accept the highlighted slash command (still completes paths and names) |
+
+**Copying out.** Drag across the transcript to select it — the run is highlighted as you go, and
+releasing the button copies it. Double-click takes a word, triple-click a line. `Ctrl+Y` copies the
+model's last turn, and `/copy [n|last]` copies any turn by number (bare `/copy` asks which one).
+Copies go out as OSC 52 first, which is the transport that survives ssh, tmux and mosh because the
+terminal owns the pasteboard, then fall back to `pbcopy`, `wl-copy`, `xclip` or `clip.exe` in a
+local session. If neither can take it, zeke says so instead of claiming a copy that never happened.
 
 The active composer rule is accented, and the bottom status bar shows context tokens, percent,
 and budget. Bracketed paste is enabled only while the TUI is active: multi-line clipboard content
@@ -213,11 +222,15 @@ Exit codes are meaningful: `0` ok, `1` error, `3` hit `--max-turns`, `130` inter
 |---|---|---|
 | `/help` | `/model` | `/profile` |
 | `/think` | `/verbose` | `/approvals` |
-| `/tools` | `/usage` | `/compact` |
-| `/clear` | `/session` | `/sessions` |
-| `/resume` | `/export` | `/bridge` |
-| `/doctor` | `/plugins` | `/prompt` |
-| `/exit` | | |
+| `/tools` | `/todo` | `/usage` |
+| `/compact` | `/clear` | `/copy` |
+| `/session` | `/sessions` | `/resume` |
+| `/export` | `/bridge` | `/doctor` |
+| `/plugins` | `/prompt` | `/exit` |
+
+Typing `/` previews every command with its one-line description, `↑`/`↓` move the highlight and
+`Tab` accepts it — so the list is discoverable without `/help`. `/todo` prints the todo tree and
+pins it open; `/copy` copies a transcript turn (`/copy last`, or `/copy 3`).
 
 `/bridge` is the same lifecycle tool as `zeke bridge …`, reachable from where the failure
 appears: `/bridge start`, `/bridge restart`, `/bridge stop`, `/bridge logs`, `/bridge models`. When
@@ -249,6 +262,60 @@ single user message:
 | `bash` | writes, exclusive | `bash {"command", "timeout"?}` — 120 s default; POSIX timeout/interruption kills the command process group; blocks `vim`, `less`, `top`, `ssh`, `sudo` |
 | `todo` | read-only, exclusive | `todo {"op", "list"?, "task"?, "phase"?, "items"?, "reason"?}` — phased task list, same contract as omp: `init`/`start`/`done`/`drop`/`block`/`unblock`/`append`/`rm`/`view`; tasks addressed by verbatim content; one task `in_progress` at a time; `/todo` shows it |
 | `ask` | writes | asks *you* a question mid-run |
+
+### Session-level todo reminders
+
+The `todo` tool owns the list; the session owns the nudging. Ported from oh-my-pi's agent-session
+layer (`session/todo-tracker.ts`), four reminders keep the list honest. Each is injected as a
+`<system-reminder>` the model sees — never written to the transcript, so a session you resume next
+week does not replay "you stopped with 3 items open" back at itself.
+
+| Nudge | Fires when | What the model is told |
+|---|---|---|
+| `eager-todo` | first turn of a session, list still empty | lay out a phased plan with one `init` before substantive work |
+| `mid-run` | 12 successful mutating tool calls since the list was last touched | "N todo items still open" — mark what you finished; at most twice a turn |
+| `todo-error` | a `todo` call failed | the failure, and to fix the payload and call again before continuing |
+| `completion` | the model stopped talking with items still open | what is left, and to continue or mark it done — at most `remindersMax` times |
+
+Guards worth knowing: nothing is injected when the model's last line is a question *for you* (it is
+waiting, not finished), when the previous nudge has not yet produced a single tool call, or when
+the run ended on an interrupt, an error, the turn cap, or still mid-tool-use. The eager prelude also
+skips prompts that end in `?` or `!` — a question is not a work list. The mid-run nudge counts only
+successful `bash`/`edit`/`write` calls (a plugin tool joins that set by declaring `mutating: true`):
+exploration is not progress you can tick off.
+
+```jsonc
+"todo": {
+  "enabled": true,       // false: zeke stops nudging (the tool stays; drop it with tools.exclude)
+  "reminders": true,     // false: no injected todo text at all
+  "remindersMax": 3,     // completion nudges per user turn
+  "eager": "preferred"   // default (off) | preferred (suggest) | always (insist)
+}
+```
+
+**The todo tree.** The list is drawn as a tree and pinned above the composer, where it cannot be
+scrolled away: phases in roman numerals, one checkbox per task (`☐` pending, `◐` running, `✔` done,
+`✗` abandoned, `!` blocked), `done/total` per phase, the active phase first. Collapsed it takes five
+rows; `Ctrl+T` opens it up to twelve, and it never takes more than a third of the screen. The footer
+keeps a `☑ done/total` counter even once the panel is gone, and `/todo` prints the same tree into
+the transcript and pins it open. In the line REPL (`--no-tui`) and in headless runs there is no
+panel to pin, so the tree is printed after each `todo` call instead — a piped run still shows the
+plan.
+
+```
+  ▸ Todos  1/5          4 open · 1 blocked · Ctrl+T expand
+  ☐ I. Research                                        1/3
+    ├─ ✔ read the parser
+    ├─ ◐ map the call sites
+    └─ ☐ write a failing test
+    … II. Fix · 2 more tasks
+```
+
+`eager: "always"` is the same prelude with imperative wording. omp pairs it with a forced
+`tool_choice: todo`; the GLM-Free-API agent shim offers no `tool_choice`, so zeke does what omp
+itself does on a model without one — send the reminder and let the model comply. zeke's default is
+`preferred` where omp's is `default` (off): the system prompt here already asks for a plan before
+substantive work, so the nudge reinforces it rather than introducing it.
 
 Approvals are policy, not a prompt you have to fight. `auto` (default) approves reads and
 writes and asks before `bash`; `--yolo` approves everything; `--ask` asks about everything.
@@ -322,7 +389,8 @@ defaults, then a project `.zeke/config.json`, then environment variables.
   "approval": { "mode": "auto" },// ask | auto | yolo
   "bridge":   { "port": 3001, "agentMode": true },
   "compaction": { "enabled": true, "targetRatio": 0.6 },
-  "tools":    { "exclude": ["bash"] }
+  "tools":    { "exclude": ["bash"] },
+  "todo":     { "eager": "preferred", "reminders": true, "remindersMax": 3 }
 }
 ```
 
@@ -398,7 +466,7 @@ lib/        primitives — jsonc, args, paths, events, json-repair
 core/       types, agent loop, approval policy, ZekeRuntime
 providers/  SSE decoding, OpenAI wire format, GLM specifics
 tools/      the eight built-ins + registry
-session/    JSONL store, compaction, export
+session/    JSONL store, compaction, export, session-level todo reminders
 ui/         ANSI + width-aware text, theme, streaming renderer, approval prompt, full-screen TUI
 cli/        argument routing, REPL, headless, setup, doctor
 plugins/    the plugin API surface

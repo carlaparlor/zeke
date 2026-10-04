@@ -237,6 +237,61 @@ export function visibleWidth(text) {
   return width;
 }
 
+/**
+ * Slice a styled string by visible columns, `[start, end)`.
+ *
+ * The result carries the SGR state that was in effect at `start` and closes
+ * with a reset, so a highlighted run can be dropped into another string — the
+ * transcript selection paints over already-coloured output — without leaking
+ * colour past the slice.
+ *
+ * The walk is over the raw string, but the *widths* come from the graphemes of
+ * its plain text, so an emoji still measures two cells. `stripAnsi` only
+ * removes CSI, so any other escape stays in the plain text and the two walks
+ * stay aligned.
+ *
+ * @param {string} text
+ * @param {number} start first visible column to keep
+ * @param {number} [end] first visible column to drop
+ */
+const CSI_STICKY = /\u001b\[[0-9;?]*[A-Za-z]/y;
+const SGR_ONLY = /^\u001b\[[0-9;]*m$/;
+
+export function sliceAnsi(text, start, end = Infinity) {
+  const source = String(text ?? "");
+  const graphemes = splitGraphemes(stripAnsi(source));
+  let out = "";
+  let carry = "";
+  let raw = 0;
+  let column = 0;
+  let index = 0;
+  while (raw < source.length && index < graphemes.length) {
+    if (source[raw] === "\u001b") {
+      CSI_STICKY.lastIndex = raw;
+      const match = CSI_STICKY.exec(source);
+      if (!match) {
+        raw += 1;
+        continue;
+      }
+      const sequence = match[0];
+      if (column < start) {
+        if (SGR_ONLY.test(sequence)) carry = sequence;
+      } else if (column < end) {
+        out += sequence;
+      }
+      raw = CSI_STICKY.lastIndex;
+      continue;
+    }
+    const grapheme = graphemes[index];
+    if (column >= start && column < end) out += grapheme;
+    column += graphemeWidth(grapheme);
+    raw += grapheme.length;
+    index += 1;
+  }
+  if (!out) return "";
+  return carry === "\u001b[0m" ? `${out}\u001b[0m` : `${carry}${out}\u001b[0m`;
+}
+
 export function truncateToWidth(text, maxWidth) {
   const plain = stripAnsi(text);
   if (visibleWidth(plain) <= maxWidth) return plain;

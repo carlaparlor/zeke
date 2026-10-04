@@ -20,7 +20,9 @@ import { keeperStatus } from "../bridge/keeper.js";
 import { bridgeCommand } from "./bridge-cli.js";
 import { GLM_MODEL_PRESETS } from "../providers/glm.js";
 import { Events } from "../lib/events.js";
-import { getTodoPhases, phasesToMarkdown } from "../tools/todo.js";
+import { getTodoPhases } from "../tools/todo.js";
+import { renderTodoTree } from "../ui/todo-tree.js";
+import { copyToClipboard } from "../ui/clipboard.js";
 
 /**
  * @param {{config: any, flags: any, cwd: string, initialPrompt?: string}} options
@@ -141,6 +143,10 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
     historySize: 500,
   });
   terminalUI?.setCompleter(completer);
+  // The palette completes from the same table /help prints.
+  terminalUI?.setCommands(
+    commandDescriptions(runtime).map(({ name, args, description }) => ({ name, args, description })),
+  );
   terminalUI?.setPrompt(promptString());
 
   banner();
@@ -148,6 +154,9 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
   if (flags.resume) {
     try {
       const store = await runtime.resume(flags.resume);
+      // A resumed session's list lives in the tool, not in the transcript: put
+      // it back on the panel.
+      terminalUI?.setTodos(getTodoPhases(store.id));
       syncTuiHeader();
       write(paint.dim(`resumed ${flags.resume} (${store.messages().length} messages)`));
     } catch (err) {
@@ -234,30 +243,9 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
   const commands = {
     help: () => {
       write(paint.bold("\nCommands"));
-      const rows = [
-        ["/help", "this list"],
-        ["/model <name>", `switch model (${GLM_MODEL_PRESETS.map((m) => m.id).join(", ")})`],
-        ["/profile <name>", "switch profile (default|fast|deep)"],
-        ["/think [on|off]", "toggle deep thinking"],
-        ["/verbose [on|off]", "toggle tool output"],
-        ["/approvals [ask|auto|yolo]", `approval mode (now: ${runtime.approvalMode})`],
-        ["/tools", "list the tools the model can call"],
-        ["/todo", "show the model's current todo list"],
-        ["/usage", "context and token usage"],
-        ["/compact", "compress older context now"],
-        ["/clear", "reset the current conversation, keeping the system prompt"],
-        ["/new", "start a separate session (Ctrl+N)"],
-        ["/session", "show the current session id and file"],
-        ["/sessions", "browse saved sessions (Ctrl+R)"],
-        ["/resume [id]", "resume a session, or open the picker"],
-        ["/export [file]", "write the transcript to a markdown file"],
-        ["/bridge [action]", "status, or start|stop|restart|logs|models"],
-        ["/doctor", "run the full diagnostic"],
-        ["/plugins", "list plugins"],
-        ["/prompt", "print the system prompt"],
-        ["/exit", "quit (ctrl-d also works)"],
-      ];
-      for (const [name, description] of rows) write(`  ${paint.cyan(name.padEnd(28))}${paint.dim(description)}`);
+      for (const command of commandDescriptions(runtime)) {
+        write(`  ${paint.cyan(command.usage.padEnd(28))}${paint.dim(command.description)}`);
+      }
       write("");
     },
 
@@ -333,21 +321,43 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
 
     todo: () => {
       const phases = getTodoPhases(runtime.session?.id ?? "default");
-      const tasks = phases.flatMap((phase) => phase.tasks);
-      if (!tasks.length) {
+      const { lines, counts } = renderTodoTree(phases, { theme, width: Math.max(24, out.columns ?? 80) });
+      // In the full-screen UI the tree is also pinned above the composer: /todo
+      // expands it, so it stays on screen after the transcript scrolls on.
+      terminalUI?.showTodos(phases);
+      if (!counts.total) {
         write(paint.dim("no todos yet — the model creates them with the `todo` tool"));
         return;
       }
-      const closed = tasks.filter((t) => t.status === "completed" || t.status === "abandoned").length;
-      write(paint.bold(`\nTodos ${paint.dim(`${closed}/${tasks.length} done`)}`));
-      for (const line of phasesToMarkdown(phases).trimEnd().split("\n")) {
-        if (line.startsWith("# ")) write(`  ${paint.cyan(line.slice(2))}`);
-        else if (line.startsWith("- [/]")) write(`  ${paint.yellow(line)}`);
-        else if (line.startsWith("- [x]")) write(`  ${paint.dim(line)}`);
-        else if (line.startsWith("- [!]")) write(`  ${paint.red(line)}`);
-        else if (line) write(`  ${line}`);
-      }
       write("");
+      write(`${theme.bold("Todos")}  ${paint.dim(`${counts.done}/${counts.total} done${counts.blocked ? ` · ${counts.blocked} blocked` : ""}`)}`);
+      for (const line of lines) write(line);
+      write("");
+    },
+
+    copy: async (arg) => {
+      const turns = terminalUI ? terminalUI.transcriptTurns() : sessionTurns(runtime);
+      const request = arg.trim();
+      if (!turns.length) {
+        write(paint.dim("nothing to copy yet"));
+        return;
+      }
+      // `/copy 2` and `/copy last` are scriptable; bare `/copy` asks.
+      const pick = request
+        ? (/^\d+$/.test(request) ? turns[Number(request) - 1] : request === "last" ? turns[turns.length - 1] : undefined)
+        : await pickTurn(turns);
+      if (!pick) {
+        write(paint.dim(request ? `no turn ${request} — /copy lists them` : "nothing copied"));
+        return;
+      }
+      if (terminalUI) {
+        // The TUI writes OSC 52 straight to the terminal and reports it itself;
+        // the log stream it hands out is the transcript, not the wire.
+        await terminalUI.copyText(pick.text);
+        return;
+      }
+      const { via } = await copyToClipboard(pick.text, { stream: process.stdout });
+      write(via ? `${paint.green(SYMBOLS.check)} copied ${pick.lines} line${pick.lines === 1 ? "" : "s"} · ${via}` : paint.red("could not reach a clipboard"));
     },
 
     usage: () => {
@@ -415,6 +425,7 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
       }
       try {
         const store = await runtime.resume(id);
+        terminalUI?.setTodos(getTodoPhases(store.id));
         syncTuiHeader();
         write(`${paint.green(SYMBOLS.check)} resumed ${id} (${store.messages().length} messages)`);
       } catch (err) {
@@ -530,6 +541,76 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
     return [matches.length ? matches : names, line];
   }
 
+  /**
+   * The transcript as copyable turns, for the line REPL: the TUI reads its own
+   * screen, this reads the conversation. Same shape either way, so `/copy`
+   * behaves the same in both.
+   *
+   * @param {any} runtime
+   * @returns {Array<{label: string, text: string, lines: number, role: "user"|"zeke"}>}
+   */
+  function sessionTurns(runtime) {
+    const turns = [];
+    let current = null;
+    for (const message of runtime.messages ?? []) {
+      // A nudge is on the wire for the model, not part of the conversation the
+      // user had: copying it would hand back text nobody ever typed.
+      if (message.role === "system" || message.synthetic) continue;
+      const role = message.role === "user" ? "user" : "zeke";
+      const text = messageText(message);
+      if (!text.trim()) continue;
+      // A turn ends where the speaker changes, so one answer — tool calls and
+      // all — copies as one block.
+      if (!current || current.role !== role) {
+        current = { role, label: "", text: "", lines: 0 };
+        turns.push(current);
+      }
+      current.text = current.text ? `${current.text}\n${text}` : text;
+      current.lines = current.text.split("\n").length;
+      if (!current.label) current.label = `${role === "user" ? "you" : "zeke"}: ${text.split("\n")[0].slice(0, 56)}`;
+    }
+    return turns;
+  }
+
+  /** The printable text of a message, whatever shape its content has. */
+  function messageText(message) {
+    const content = message?.content;
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      return content
+        .map((part) => (typeof part === "string" ? part : String(part?.text ?? part?.content ?? "")))
+        .join("\n")
+        .trim();
+    }
+    return "";
+  }
+
+  /**
+   * Ask which transcript turn to copy. The full-screen UI gets its own picker;
+   * the line REPL prints the list and takes a number.
+   */
+  async function pickTurn(turns) {
+    if (terminalUI) {
+      const picked = await terminalUI.select(
+        "Copy which turn?",
+        turns.slice(-9).map((turn, index) => ({
+          label: turn.label,
+          description: `${turn.lines} line${turn.lines === 1 ? "" : "s"}`,
+          value: String(turns.length - Math.min(turns.length, 9) + index),
+        })),
+      );
+      return picked === null || picked === undefined ? null : turns[Number(picked)];
+    }
+    write(paint.bold("\nCopy which turn?"));
+    turns.slice(-9).forEach((turn, index) => {
+      const number = turns.length - Math.min(turns.length, 9) + index + 1;
+      write(`  ${paint.cyan(String(number).padEnd(4))}${paint.dim(`${turn.lines} lines`)}  ${turn.label}`);
+    });
+    const answer = (await ask("number, or blank to cancel", []))?.custom ?? "";
+    const index = Number(answer.trim());
+    return Number.isInteger(index) && index >= 1 && index <= turns.length ? turns[index - 1] : null;
+  }
+
   function banner() {
     const model = runtime.config.model;
     // The full-screen title/status bars and empty-state panel already carry
@@ -595,6 +676,41 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
     write(savedMessage);
   }
   return exitCode;
+}
+
+/**
+ * Every slash command, once. `/help` prints it and the TUI's palette completes
+ * from it, so the two can never drift.
+ *
+ * @param {any} runtime
+ * @returns {Array<{name: string, args?: string, usage: string, description: string}>}
+ */
+export function commandDescriptions(runtime) {
+  const models = GLM_MODEL_PRESETS.map((m) => m.id).join(", ");
+  return [
+    { name: "help", usage: "/help", description: "this list" },
+    { name: "model", args: "<name>", usage: "/model <name>", description: `switch model (${models})` },
+    { name: "profile", args: "<name>", usage: "/profile <name>", description: "switch profile (default|fast|deep)" },
+    { name: "think", args: "[on|off]", usage: "/think [on|off]", description: "toggle deep thinking" },
+    { name: "verbose", args: "[on|off]", usage: "/verbose [on|off]", description: "toggle tool output" },
+    { name: "approvals", args: "[ask|auto|yolo]", usage: "/approvals [ask|auto|yolo]", description: `approval mode (now: ${runtime.approvalMode})` },
+    { name: "tools", usage: "/tools", description: "list the tools the model can call" },
+    { name: "todo", usage: "/todo", description: "show the todo tree; Ctrl+T expands the panel" },
+    { name: "copy", args: "[n|last]", usage: "/copy [n|last]", description: "copy a transcript turn to the clipboard" },
+    { name: "usage", usage: "/usage", description: "context and token usage" },
+    { name: "compact", usage: "/compact", description: "compress older context now" },
+    { name: "clear", usage: "/clear", description: "reset the current conversation, keeping the system prompt" },
+    { name: "new", usage: "/new", description: "start a separate session (Ctrl+N)" },
+    { name: "session", usage: "/session", description: "show the current session id and file" },
+    { name: "sessions", usage: "/sessions", description: "browse saved sessions (Ctrl+R)" },
+    { name: "resume", args: "[id]", usage: "/resume [id]", description: "resume a session, or open the picker" },
+    { name: "export", args: "[file]", usage: "/export [file]", description: "write the transcript to a markdown file" },
+    { name: "bridge", args: "[action]", usage: "/bridge [action]", description: "status, or start|stop|restart|logs|models" },
+    { name: "doctor", usage: "/doctor", description: "run the full diagnostic" },
+    { name: "plugins", usage: "/plugins", description: "list plugins" },
+    { name: "prompt", usage: "/prompt", description: "print the system prompt" },
+    { name: "exit", usage: "/exit", description: "quit (ctrl-d also works)" },
+  ];
 }
 
 /** Force a compaction pass regardless of the token threshold. */

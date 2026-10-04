@@ -78,6 +78,8 @@ export const Events = /** @type {const} */ ({
   TOOL_CALL_OUTPUT: "tool.call.output",
   TOOL_CALL_END: "tool.call.end",
   NOTICE: "notice",
+  TODO_REMINDER: "todo.reminder",
+  TODO_UPDATE: "todo.update",
   SESSION_START: "session.start",
   SESSION_END: "session.end",
   COMPACT: "compact",
