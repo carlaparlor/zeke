@@ -704,6 +704,23 @@ describe("tokens", () => {
     }
   });
 
+  test("collect --dry-run also says whether the network can reach chat.z.ai", async () => {
+    const box = await sandbox();
+    try {
+      const result = await zeke(["tokens", "collect", "--dry-run"], { cwd: box.cwd, env: { ZEKE_HOME: box.home } });
+      // The one prerequisite that is not local, and the one that shows up as a
+      // Playwright DNS error if nobody checks it first. Either answer is fine —
+      // what matters is that the check exists and reports the host.
+      assert.match(result.stdout, /network\s+chat\.z\.ai (resolves to \S+|does not resolve|check skipped)/);
+      if (/does not resolve/.test(result.stdout)) {
+        assert.match(result.stdout, /blocker: .*chat\.z\.ai/);
+        assert.equal(result.code, 1);
+      }
+    } finally {
+      await box.cleanup();
+    }
+  });
+
   test("collect runs the collector from ZEKE_HOME and hot-swaps the pool it wrote", async () => {
     const box = await sandbox();
     const bridge = await startMockBridge({ tokenCount: 7 });
@@ -718,7 +735,10 @@ describe("tokens", () => {
 
       const result = await zeke(["tokens", "collect", "--tokens", "5", "--no-tui"], {
         cwd: box.cwd,
-        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: bridge.baseUrl, ZEKE_API_KEY: "Waguri" },
+        // This test asserts the cwd contract, not the network — the collector
+        // must run where the bridge reads the pool from. Skipping the network
+        // check keeps the suite honest on a machine with no DNS.
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: bridge.baseUrl, ZEKE_API_KEY: "Waguri", ZEKE_SKIP_NETWORK_CHECK: "1" },
       });
       assert.equal(result.code, 0, result.stdout + result.stderr);
       assert.match(result.stdout, /harvested into/);

@@ -97,7 +97,8 @@ which `npx playwright install-deps chromium` installs. Tokens are consumed FIFO 
 use, so a busy session drains the pool and refills it the same way. Hot-swap posts to the bridge's
 `/sqlite` endpoint, so a drained pool can be refilled mid-session without losing context.
 
-`zeke tokens collect --dry-run` prints what harvesting needs before anything runs.
+`zeke tokens collect --dry-run` prints what harvesting needs before anything runs — including whether
+`chat.z.ai` resolves, the one prerequisite that is not local.
 
 **A personal JWT — optional, recommended.** `chat.z.ai` → DevTools → Local Storage → key
 `token`:
@@ -124,7 +125,9 @@ the *keeper* — takes over the two chores that used to make zeke tedious:
 * **The pool never runs dry.** Every few seconds the keeper reads the pool level off `/health`;
   when it drops below `bridge.minTokens` it runs the token collector headlessly (`--no-tui`),
   hot-swaps the result into the live bridge, and backs off exponentially (1 min doubling to a
-  30 min cap) if harvesting fails, so it never hammers chat.z.ai.
+  30 min cap) if harvesting fails, so it never hammers chat.z.ai. Before it launches anything it
+  resolves `chat.z.ai`: a network outage costs a DNS lookup, not a browser start, and it recovers
+  by itself once the host answers again.
 
 ```sh
 zeke bridge status    # shows the bridge, the pool, and what the keeper has been doing
@@ -487,7 +490,7 @@ breaker's `503` + `Retry-After` backoff.
 ## Tests
 
 ```sh
-npm test          # 468 tests in 15 files
+npm test          # 560 tests in 19 files
 npm run selftest  # end-to-end: real CLI against a mock bridge
 zeke selftest     # same suite, from an installed checkout
 ```
@@ -503,6 +506,10 @@ session. The mock also reproduces the bridge's *streaming-branch
 failure shape* (HTTP 200 + `data: {"error": …}` + `[DONE]`) and its empty-pool captcha failure,
 which is how `zeke setup` and `zeke doctor` are tested against the exact confusion this repo was
 born from.
+
+The suite does one thing that touches the network: `zeke tokens collect --dry-run` resolves
+`chat.z.ai`, and the CLI test accepts either answer (resolved, or the failure with its blocker) — the
+resolver logic itself is unit-tested with injected lookups, so an offline machine stays green.
 
 Two things are honestly **not** covered, because this sandbox cannot reach them:
 
@@ -545,6 +552,16 @@ A `ZAI_TOKEN` does not change this; the captcha is per request regardless.
 `$ZEKE_HOME` — zeke does that for you, and reports the path it harvested into. If it stopped
 early, the browser is the usual cause: run it once with `--no-tui` to see the error, and install
 the system libraries with `npx playwright install-deps chromium`.
+
+**Harvesting dies with `net::ERR_NAME_NOT_RESOLVED` (or `ERR_PROXY_CONNECTION_FAILED`,
+`ERR_CERT_…`).** That is the collector's browser failing to reach `chat.z.ai` — not a token, auth or
+login problem, however much the retry lines look like one. Because the browser resolves the host
+itself, a DNS or proxy failure used to surface after a browser launch, an install check and three
+attempts. zeke now resolves `chat.z.ai` before it launches anything: `zeke tokens collect` refuses to
+start a harvest that cannot work and names the cause, the keeper logs the same reason and backs off
+without spending a browser, and `zeke tokens collect --dry-run` shows the check up front. If your
+lookup is the only thing failing (Secure DNS, split tunnels) and the browser can still get out, use
+`ZEKE_SKIP_NETWORK_CHECK=1 zeke tokens collect`.
 
 **Harvesting fails before it starts.** `zeke tokens collect --dry-run` shows the whole path:
 whether the collector is built (it is built on demand from `vendor/glm-free-api`), whether the

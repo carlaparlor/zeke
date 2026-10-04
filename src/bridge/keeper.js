@@ -22,7 +22,7 @@ import { appendFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promis
 import path from "node:path";
 import { paths } from "../lib/paths.js";
 import { bridgeConfigFrom, health as bridgeHealth, isLocalBridge, startBridge } from "./bridge.js";
-import { harvestTokens } from "./collector.js";
+import { diagnoseCollectorFailure, harvestTokens, probeChatZai } from "./collector.js";
 
 /** How long a harvest lock outlives its process before it can be stolen. */
 const LOCK_STALE_MS = 5 * 60_000;
@@ -299,20 +299,22 @@ export async function runKeeperLoop(options = {}) {
   const harvestRun =
     options.harvestRun ??
     (async (ctx) => {
+      let output = "";
       const result = await harvestTokens({
         config: ctx.bridgeConfig,
         flags: harvestFlags(ctx.harvest),
         quiet: true,
-        onOutput: ctx.log,
+        // An unattended harvest that cannot reach chat.z.ai must not spend a
+        // browser launch, a Playwright install check and three retries on it —
+        // and what it reports has to name the network, because nobody is
+        // watching a TUI here.
+        preflight: () => probeChatZai(),
+        onOutput: (chunk) => {
+          output += chunk;
+          return ctx.log(chunk);
+        },
       });
-      // harvestTokens reports richly; the loop wants one verdict.
-      if (!result.ran) {
-        const blocker = result.readiness?.blockers?.[0];
-        return { ok: false, error: blocker ? blocker.message : "harvesting is not possible — `zeke doctor` says why" };
-      }
-      if (result.code !== 0) return { ok: false, error: `the collector exited with ${result.code}` };
-      if (!result.harvested) return { ok: false, error: "the collector finished but wrote no tokens" };
-      return { ok: true, tokenCount: result.swapped ? result.tokenCount : -1 };
+      return harvestVerdict(result, output);
     });
   const sleepFn = options.sleep ?? sleep;
   const now = options.now ?? Date.now;
@@ -443,6 +445,33 @@ async function interruptibleSleep(sleepFn, totalMs, shouldStop) {
     if (shouldStop()) return;
     await sleepFn(Math.min(slice, totalMs - waited));
   }
+}
+
+/**
+ * One harvest result → the one verdict the keeper loop logs and backs off on.
+ *
+ * `harvestTokens` reports richly; the loop wants `{ok, error}` and, when the
+ * run failed, a reason a human can act on. The captured output is the fallback
+ * for collectors that fail without a preflight having caught it first.
+ *
+ * @param {{ran: boolean, code: number, harvested: boolean, swapped: boolean, tokenCount: number, diagnosis?: any, readiness?: any}} result
+ * @param {string} [output] everything the collector printed
+ * @returns {{ok: boolean, tokenCount?: number, error?: string}}
+ */
+export function harvestVerdict(result, output = "") {
+  if (!result.ran) {
+    const blocker = result.readiness?.blockers?.[0];
+    return { ok: false, error: blocker ? blocker.message : "harvesting is not possible — `zeke doctor` says why" };
+  }
+  if (result.code !== 0) {
+    const diagnosis = result.diagnosis ?? diagnoseCollectorFailure(output);
+    return {
+      ok: false,
+      error: diagnosis ? `${diagnosis.message} — ${diagnosis.fix}` : `the collector exited with ${result.code}`,
+    };
+  }
+  if (!result.harvested) return { ok: false, error: "the collector finished but wrote no tokens" };
+  return { ok: true, tokenCount: result.swapped ? result.tokenCount : -1 };
 }
 
 /** Collector flags for an unattended top-up: plain text, fixed batch size. */

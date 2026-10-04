@@ -3,7 +3,7 @@
 import { access, stat } from "node:fs/promises";
 import { paths } from "../lib/paths.js";
 import { findGo, hasGoSource, readBuildInfo, sourceFingerprint } from "../bridge/build.js";
-import { collectReadiness } from "../bridge/collector.js";
+import { collectReadiness, probeChatZai } from "../bridge/collector.js";
 import { health as bridgeHealth, listBridgeModels, readLogTail, readPid } from "../bridge/bridge.js";
 import { createGlmProvider } from "../providers/glm.js";
 import { loadSecrets, maskSecret } from "../config/index.js";
@@ -21,10 +21,10 @@ import { style } from "../ui/ansi.js";
  * Run every diagnostic. Exported separately from the CLI command so tests can
  * assert on the results instead of scraping stdout.
  *
- * @param {{config: any, deep?: boolean}} options
+ * @param {{config: any, deep?: boolean, probeNetwork?: () => Promise<any>}} options
  * @returns {Promise<Check[]>}
  */
-export async function runDiagnostics({ config, deep = false }) {
+export async function runDiagnostics({ config, deep = false, probeNetwork = probeChatZai }) {
   /** @type {Check[]} */
   const checks = [];
   const push = (name, status, detail, hint) => checks.push({ name, status, detail, hint });
@@ -131,15 +131,31 @@ export async function runDiagnostics({ config, deep = false }) {
     // and "install Go / install the browser libraries first".
     if (live.tokenCount <= 0) {
       const harvest = await collectReadiness();
+      // Only once the local pieces exist is the network the question worth
+      // asking: if the collector cannot be built, that is the answer, and
+      // resolving chat.z.ai would just be noise on the way to it.
+      const network = harvest.ready ? await probeNetwork() : null;
+      const local = harvest.ready
+        ? `${harvest.collector.exists ? "collector built" : "collector will be built on demand"}; ${harvest.browsers.any ? "Playwright browsers cached" : "browsers download on first run"}`
+        : harvest.blockers.map((b) => b.message).join("; ");
+      const reachable = Boolean(network?.ok);
       push(
         "harvest path",
-        harvest.ready ? "warn" : "fail",
-        harvest.ready
-          ? `${harvest.collector.exists ? "collector built" : "collector will be built on demand"}; ${harvest.browsers.any ? "Playwright browsers cached" : "browsers download on first run"}`
-          : harvest.blockers.map((b) => b.message).join("; "),
-        harvest.ready
+        harvest.ready && reachable ? "warn" : "fail",
+        network
+          ? `${local}; ${
+              network.skipped
+                ? `${network.host} check skipped`
+                : reachable
+                  ? `${network.host} resolves`
+                  : `${network.host} does not resolve (${network.code})`
+            }`
+          : local,
+        harvest.ready && reachable
           ? "`zeke tokens collect` harvests a batch (`zeke tokens collect --dry-run` to inspect first)"
-          : harvest.blockers.map((b) => b.fix).join("; "),
+          : harvest.ready
+            ? `${network.fix}; \`zeke tokens collect\` re-runs the check, and \`ZEKE_SKIP_NETWORK_CHECK=1\` skips it`
+            : harvest.blockers.map((b) => b.fix).join("; "),
       );
     }
 
