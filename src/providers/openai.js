@@ -11,6 +11,7 @@
 //     is force-disabled by the bridge while agent mode is on.
 
 import { OpenAiChunkAccumulator, SseDecoder, inlineErrorOf, isDoneMarker, normalizeUsage, readBodyAsText } from "./sse.js";
+import { ThinkingDecoder } from "./thinking.js";
 import { finalizeToolCall, repairHistory, toOpenAiMessages, toOpenAiTools } from "./messages.js";
 
 export class ProviderError extends Error {
@@ -270,63 +271,69 @@ export function createOpenAiProvider(config) {
     const headerState = new Map();
     const zekeIdByIndex = new Map();
 
-    for await (const chunk of readBodyAsText(response.body, controller.signal)) {
-      for (const event of decoder.push(chunk)) {
-        if (isDoneMarker(event)) continue;
-        let json;
-        try {
-          json = JSON.parse(event.data);
-        } catch {
-          continue; // keep-alive ping or a split line: nothing to act on
-        }
-        // The bridge streams upstream failures inline with a 200 status.
-        const inlineError = inlineErrorOf(json);
-        if (inlineError) throw fromInlineError(inlineError, config.baseUrl);
-        acc.add(json);
+    const contentDecoder = new ThinkingDecoder();
+    const reasoningDecoder = new ThinkingDecoder();
+    let content = "";
 
-        const delta = json?.choices?.[0]?.delta ?? {};
-        if (typeof delta.content === "string" && delta.content) yield { type: "text", text: delta.content };
-        const thinkingText = delta.reasoning_content ?? delta.reasoning;
-        if (typeof thinkingText === "string" && thinkingText) yield { type: "thinking", text: thinkingText };
-
-        for (const fragment of delta.tool_calls ?? []) {
-          const index = typeof fragment.index === "number" ? fragment.index : 0;
-          const state = headerState.get(index) ?? { id: "", name: "", sentHeader: false };
-          if (fragment.id) state.id = fragment.id;
-          const fn = fragment.function ?? {};
-          if (fn.name && !state.name) state.name = fn.name;
-
-          if (!state.sentHeader && state.name) {
-            state.sentHeader = true;
-            const zekeId = state.id || `call_${index}_${Math.random().toString(36).slice(2, 8)}`;
-            zekeIdByIndex.set(index, zekeId);
-            yield { type: "toolcall_start", toolCall: { id: zekeId, name: state.name, arguments: {} } };
-          }
-          if (typeof fn.arguments === "string" && fn.arguments) {
-            yield {
-              type: "toolcall_delta",
-              argsDelta: fn.arguments,
-              toolCall: { id: zekeIdByIndex.get(index) ?? "", name: state.name, arguments: {} },
-            };
-          }
-          headerState.set(index, state);
-        }
-      }
-    }
-
-    for (const event of decoder.flush()) {
-      if (isDoneMarker(event)) continue;
+    function* handleEvent(event) {
+      if (isDoneMarker(event)) return;
+      let json;
       try {
-        const json = JSON.parse(event.data);
-        // An inline error that arrived without its blank line still counts.
-        const inlineError = inlineErrorOf(json);
-        if (inlineError) throw fromInlineError(inlineError, config.baseUrl);
-        acc.add(json);
-      } catch (err) {
-        if (err instanceof ProviderError) throw err;
-        // ignore: an unterminated tail line carries no signal
+        json = JSON.parse(event.data);
+      } catch {
+        return; // Ignore non-JSON keep-alives.
+      }
+      // The bridge streams upstream failures inline with a 200 status.
+      const inlineError = inlineErrorOf(json);
+      if (inlineError) throw fromInlineError(inlineError, config.baseUrl);
+      acc.add(json);
+
+      const delta = json?.choices?.[0]?.delta ?? {};
+      if (typeof delta.content === "string") {
+        for (const event of contentDecoder.push(delta.content)) {
+          if (event.type === "text") content += event.text;
+          yield event;
+        }
+      }
+      const thinkingText = delta.reasoning_content ?? delta.reasoning;
+      if (typeof thinkingText === "string") {
+        for (const event of reasoningDecoder.push(thinkingText)) yield { type: "thinking", text: event.text };
+      }
+
+      for (const fragment of delta.tool_calls ?? []) {
+        const index = typeof fragment.index === "number" ? fragment.index : 0;
+        const state = headerState.get(index) ?? { id: "", name: "", sentHeader: false };
+        if (fragment.id) state.id = fragment.id;
+        const fn = fragment.function ?? {};
+        if (fn.name && !state.name) state.name = fn.name;
+
+        if (!state.sentHeader && state.name) {
+          state.sentHeader = true;
+          const zekeId = state.id || `call_${index}_${Math.random().toString(36).slice(2, 8)}`;
+          zekeIdByIndex.set(index, zekeId);
+          yield { type: "toolcall_start", toolCall: { id: zekeId, name: state.name, arguments: {} } };
+        }
+        if (typeof fn.arguments === "string" && fn.arguments) {
+          yield {
+            type: "toolcall_delta",
+            argsDelta: fn.arguments,
+            toolCall: { id: zekeIdByIndex.get(index) ?? "", name: state.name, arguments: {} },
+          };
+        }
+        headerState.set(index, state);
       }
     }
+
+    for await (const chunk of readBodyAsText(response.body, controller.signal)) {
+      for (const event of decoder.push(chunk)) yield* handleEvent(event);
+    }
+    // The final SSE event may lack its terminating blank line.
+    for (const event of decoder.flush()) yield* handleEvent(event);
+    for (const event of contentDecoder.finish()) {
+      if (event.type === "text") content += event.text;
+      yield event;
+    }
+    for (const event of reasoningDecoder.finish()) yield { type: "thinking", text: event.text };
 
     const usage = acc.usage;
     if (usage) yield { type: "usage", usage };
@@ -339,7 +346,7 @@ export function createOpenAiProvider(config) {
         type: "message",
         message: {
           role: "assistant",
-          content: acc.content,
+          content,
           toolCalls: finalized,
           stopReason: "tool_calls",
           usage,
@@ -353,7 +360,7 @@ export function createOpenAiProvider(config) {
       type: "message",
       message: {
         role: "assistant",
-        content: acc.content,
+        content,
         stopReason: acc.finishReason === "length" ? "length" : "stop",
         usage,
         model: acc.model,
