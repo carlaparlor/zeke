@@ -59,6 +59,36 @@ export function bridgeBaseUrl(config = {}) {
 }
 
 /**
+ * The bridge config a resolved zeke config implies. Lives here (not in the
+ * CLI) because the keeper needs the same shape without reaching up a layer.
+ * @param {{bridge?: any, apiKey?: string, zaiToken?: string|null}} config
+ */
+export function bridgeConfigFrom(config) {
+  const bridge = config.bridge ?? {};
+  return {
+    host: bridge.host,
+    port: bridge.port,
+    authToken: config.apiKey,
+    agentMode: bridge.agentMode !== false,
+    sessionPoolSize: bridge.sessionPoolSize,
+    sessionReuseCount: bridge.sessionReuseCount,
+    zaiToken: config.zaiToken ?? undefined,
+    tokenDb: paths.tokenDb(),
+    binary: bridge.binary ?? paths.bridgeBinary(),
+  };
+}
+
+/**
+ * Whether the configured bridge is one this machine can own: a plain http
+ * endpoint on loopback. A remote or https endpoint is someone else's process —
+ * zeke talks to it but never starts, restarts or supervises it.
+ */
+export function isLocalBridge(config = {}) {
+  const host = String(config.host ?? "127.0.0.1").toLowerCase();
+  return ["127.0.0.1", "localhost", "::1", "[::1]"].includes(host);
+}
+
+/**
  * Start the bridge. Rejects if something is already listening on the port.
  *
  * @param {BridgeConfig} config

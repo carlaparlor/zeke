@@ -270,6 +270,19 @@ export async function setupCommand({ flags, config }) {
   }
   summary.steps.push("verify");
 
+  // From here the install maintains itself: the keeper starts the bridge when
+  // it is down, restarts it when it crashes, and harvests device tokens
+  // before the pool runs dry. It outlives this command on purpose.
+  if (!flags["no-keeper"]) {
+    try {
+      const keeper = await startKeeper();
+      if (keeper.started) ok(`keeper running (pid ${keeper.pid}) — the bridge and token pool now maintain themselves`);
+      else ok(`keeper already running (pid ${keeper.pid})`);
+    } catch (err) {
+      warn(`keeper not started (${err.message}) — zeke will retry it on the next run`);
+    }
+  }
+
   return report(summary, paint, log, flags, providerConfig.model);
 }
 

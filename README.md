@@ -24,7 +24,9 @@ array and you get prose where you expected a file edit.
 
 zeke assumes you run the bridge yourself, with your own tokens, and it manages that bridge for
 you: building it, starting it with the right flags, harvesting device tokens, hot-swapping them
-without a restart, and diagnosing the whole chain when something is off.
+without a restart, and diagnosing the whole chain when something is off. After `zeke setup` it
+also **maintains itself** — see [The keeper](#the-keeper) below: the bridge is started on demand,
+restarted when it dies, and the token pool is topped up before it runs dry.
 
 One thing about that chain is easy to miss, and zeke goes out of its way to say it loudly: the
 bridge signs **every** request with an Aliyun `captcha_verify_param`, and each captcha spends one
@@ -83,6 +85,10 @@ zeke tokens status               # how many are left
 zeke tokens swap ./tokens.sqlite # hot-swap a pool you harvested elsewhere
 ```
 
+You rarely need any of that by hand: after setup, [the keeper](#the-keeper) harvests on its own
+whenever the pool drops below `bridge.minTokens`. Manual `collect` remains for the moments you
+want a batch right now (it and the keeper share a lock, so they never run on top of each other).
+
 `collect` builds `token-collector` from the vendored source on demand, runs it from `$ZEKE_HOME`
 (the collector writes `./tokens.sqlite` into its working directory — there is no `--db-path` flag
 upstream), and hot-swaps the result in. The collector downloads its own Playwright driver and
@@ -104,6 +110,47 @@ A JWT unlocks every model, including the vision models. Without one you are a gu
 get only `glm-5.3-flash` and `glm-4.7`. It does **not** replace the device-token pool: the
 captcha is minted per request either way, so zeke defaults to `glm-4.7` for guest sessions and
 still expects a harvested pool behind it.
+
+---
+
+## The keeper
+
+After `zeke setup` (and on every `zeke` run that finds it missing), a small detached process —
+the *keeper* — takes over the two chores that used to make zeke tedious:
+
+* **The bridge stays up.** If it is down when you run zeke, it starts first and the session
+  follows. If it crashes mid-day, the keeper restarts it within `bridge.checkSeconds`. It keeps
+  this up until you stop it — not until your terminal closes.
+* **The pool never runs dry.** Every few seconds the keeper reads the pool level off `/health`;
+  when it drops below `bridge.minTokens` it runs the token collector headlessly (`--no-tui`),
+  hot-swaps the result into the live bridge, and backs off exponentially (1 min doubling to a
+  30 min cap) if harvesting fails, so it never hammers chat.z.ai.
+
+```sh
+zeke bridge status    # shows the bridge, the pool, and what the keeper has been doing
+zeke tokens status    # same keeper line, from the tokens' point of view
+zeke bridge stop      # the one off-switch: stops keeper and bridge until you start them again
+```
+
+That `stop` is deliberate: the keeper goes first, so it cannot read your stop as a crash and
+undo it. The next `zeke` run brings everything back.
+
+Config (all under `bridge` in `$ZEKE_HOME/config.json`):
+
+```jsonc
+{
+  "bridge": {
+    "keepAlive": true,       // the keeper supervises at all
+    "autoStart": true,       // zeke may start the bridge when it is down
+    "minTokens": 5,          // harvest when the pool drops below this
+    "checkSeconds": 20,      // how often the keeper looks
+    "harvest": { "tokens": 500, "batch": 2, "parallel": 1 }  // flags for the collector
+  }
+}
+```
+
+Pointing `ZEKE_BASE_URL` at a remote bridge disables all of it automatically: zeke supervises
+only bridges on loopback that it could have started itself.
 
 ---
 
@@ -173,10 +220,10 @@ Restrict the set per run with `--tools read,grep` or `--no-tools` for chat only.
 ## Commands
 
 ```
-zeke setup       build the bridge and configure tokens (start here)
+zeke setup       build the bridge, configure tokens, start the keeper (start here)
 zeke doctor      diagnose the whole toolchain
-zeke bridge      start | stop | restart | status | models | logs
-zeke tokens      collect | status | swap | teleport
+zeke bridge      start | stop | restart | status | models | logs — stop ends the keeper too
+zeke tokens      collect | status | swap | teleport — collect is the manual override
 zeke config      get | set | unset | profiles
 zeke models      what the bridge offers
 zeke tools       zeke's tools and their contracts

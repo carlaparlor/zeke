@@ -75,11 +75,16 @@ import("node:http").then(({ default: http }) => {
 });
 `;
 
+/** A binary that exists but cannot serve: zeke can try, nothing will listen. */
+const BROKEN_BRIDGE = `#!/usr/bin/env node
+process.exit(1);
+`;
+
 /** Put a runnable fake bridge where zeke looks for the real one. */
-async function installFakeBridge(home) {
+async function installFakeBridge(home, source = FAKE_BRIDGE) {
   const file = path.join(home, "bin", process.platform === "win32" ? "zai-api.exe" : "zai-api");
   await mkdir(path.dirname(file), { recursive: true });
-  await writeFile(file, FAKE_BRIDGE);
+  await writeFile(file, source);
   await chmod(file, 0o755);
   return file;
 }
@@ -96,12 +101,14 @@ async function stopBridgeFromPidFile(home) {
 describe("repl recovery", () => {
   test("a dead bridge fails once, with the reason and the in-session fix", async () => {
     const box = await sandbox();
-    await installFakeBridge(box.home);
+    // A binary that cannot listen: zeke's auto-start tries it and fails, so
+    // the session itself still meets a bridge that is truly unreachable.
+    await installFakeBridge(box.home, BROKEN_BRIDGE);
     const port = await unusedPort();
     try {
       const result = await repl(["/exit"], {
         cwd: box.cwd,
-        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: `http://127.0.0.1:${port}/v1` },
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: `http://127.0.0.1:${port}/v1`, ZEKE_NO_KEEPER: "1" },
       });
       assert.match(result.stdout, /connection refused/);
       // No pointless retries against a port that cannot answer, and the error
@@ -146,20 +153,39 @@ describe("repl recovery", () => {
     }
   });
 
-  test("/bridge start brings a bridge up and /bridge then reports it", async () => {
+  test("zeke brings the bridge up before the session, and /bridge reports it", async () => {
     const port = await unusedPort();
     const box = await sandbox({ home: { config: { bridge: { port } } } });
     await installFakeBridge(box.home);
     try {
-      const result = await repl(["/bridge start", "/bridge", "/exit"], {
+      // No manual start: zeke itself is expected to start the bridge first.
+      const result = await repl(["/bridge", "/exit"], {
         cwd: box.cwd,
-        env: { ZEKE_HOME: box.home },
+        env: { ZEKE_HOME: box.home, ZEKE_NO_KEEPER: "1" },
         timeoutMs: 40_000,
       });
-      assert.match(result.stdout, new RegExp(`bridge on http://127\\.0\\.0\\.1:${port}`));
-      assert.match(result.stdout, /url      http:\/\/127\.0\.0\.1:\d+/);
+      assert.match(result.stderr, /bridge was down — started it/);
+      assert.match(result.stdout, new RegExp(`url      http://127\\.0\\.0\\.1:${port}`));
       assert.match(result.stdout, /healthy  yes/);
       assert.match(result.stdout, /tokens   2/);
+    } finally {
+      await stopBridgeFromPidFile(box.home);
+      await box.cleanup();
+    }
+  });
+
+  test("/bridge start on an already-running bridge says so instead of failing", async () => {
+    const port = await unusedPort();
+    const box = await sandbox({ home: { config: { bridge: { port } } } });
+    await installFakeBridge(box.home);
+    try {
+      const result = await repl(["/bridge start", "/exit"], {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, ZEKE_NO_KEEPER: "1" },
+        timeoutMs: 40_000,
+      });
+      assert.match(result.stderr, /bridge was down — started it/);
+      assert.match(result.stdout, /a bridge is already answering/);
     } finally {
       await stopBridgeFromPidFile(box.home);
       await box.cleanup();
