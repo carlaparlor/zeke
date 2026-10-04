@@ -25,6 +25,7 @@ const GLOBAL_SPEC = {
   profile: { type: "string", metavar: "name", description: "Config profile (default|fast|deep)" },
   thinking: { type: "boolean", description: "Enable deep thinking" },
   verbose: { alias: "v", type: "boolean", description: "Show tool output and turn markers" },
+  "no-tui": { type: "boolean", description: "Use the line-oriented REPL instead of the full-screen TUI" },
   quiet: { alias: "q", type: "boolean", description: "Headless: final answer only" },
   yolo: { type: "boolean", description: "Approve every tool call without asking" },
   ask: { type: "boolean", description: "Confirm every tool call" },

@@ -156,8 +156,27 @@ only bridges on loopback that it could have started itself.
 
 ## Using it
 
-**Interactive** — `zeke` starts a session in the current directory. `zeke "fix the failing
-test"` seeds it with a request.
+**Interactive** — `zeke` starts a keyboard-driven, full-screen session when stdin and stdout
+are terminals. `zeke "fix the failing test"` seeds it with a request. The interface keeps model
+output, tool activity, approvals and context status together; it restores the terminal when you
+leave. Use `--no-tui` to force the scrolling, line-oriented REPL, or when working through a
+terminal wrapper that does not support alternate screens.
+
+| Key | Action |
+|---|---|
+| `Enter` | Send the current prompt |
+| `Ctrl+J` | Insert a newline in a multi-line prompt |
+| `↑` / `↓` | Browse prompt history (or move within a multi-line prompt) |
+| `PageUp` / `PageDown` | Scroll the transcript |
+| `Ctrl+R` | Search and resume a saved session |
+| `Ctrl+N` | Start a distinct session without losing the current one |
+| `Ctrl+C` | Interrupt a running turn; quit when idle |
+| `Tab` | Complete slash commands |
+
+`/resume` opens the session picker; `/resume <id>` still works. `/new` starts a separate saved
+session without discarding the previous transcript. `/clear` resets only the in-memory conversation;
+the saved transcript remains available to resume. Piped/scripted sessions keep the line-oriented
+REPL so existing automation remains usable.
 
 **Headless** — for scripts and CI:
 
@@ -188,8 +207,12 @@ a turn fails because nothing is listening, the hint points at `/bridge start` �
 the session to fix it. (If there is no bridge binary yet, the hint says so instead of naming a
 command that cannot work.)
 
-**Context memory.** Drop a `ZEKE.md` (or `AGENTS.md`) in your project root and zeke reads it as
-project instructions. `ZEKE.md` wins if both exist.
+**Project context.** Zeke loads applicable `ZEKE.md` / `AGENTS.md` files from the repository root
+through the current directory (`ZEKE.md` wins at a given level; more-local rules refine parent
+rules). It reads package scripts for test, lint, type-check and build commands, plus conventional test
+commands for Go, Cargo, configured pytest, Make, Maven and Gradle, and shows those hints in the
+system prompt. Zeke never executes project scripts during startup. Before editing a subdirectory, it
+is instructed to check for more-local rules.
 
 ---
 
@@ -205,7 +228,7 @@ single user message:
 | `edit` | writes | `edit {"path", "operations"[]}` — replace / insert_before / insert_after / delete / create |
 | `glob` | read-only | `glob {"pattern", "path"?}` |
 | `grep` | read-only | `grep {"pattern", "glob"?}` |
-| `bash` | writes, exclusive | `bash {"command", "timeout"?}` — 120 s default; blocks `vim`, `less`, `top`, `ssh`, `sudo` |
+| `bash` | writes, exclusive | `bash {"command", "timeout"?}` — 120 s default; POSIX timeout/interruption kills the command process group; blocks `vim`, `less`, `top`, `ssh`, `sudo` |
 | `todo` | writes | task list the model maintains across turns |
 | `ask` | writes | asks *you* a question mid-run |
 
@@ -343,7 +366,7 @@ core/       types, agent loop, approval policy, ZekeRuntime
 providers/  SSE decoding, OpenAI wire format, GLM specifics
 tools/      the eight built-ins + registry
 session/    JSONL store, compaction, export
-ui/         ANSI, renderer, approval prompt
+ui/         ANSI, streaming renderer, approval prompt, keyboard-driven full-screen TUI
 cli/        argument routing, REPL, headless, setup, doctor
 plugins/    the plugin API surface
 bridge/     process management, vendoring, Go build
@@ -363,7 +386,7 @@ breaker's `503` + `Retry-After` backoff.
 ## Tests
 
 ```sh
-npm test          # 372 tests in 13 files
+npm test          # 417 tests in 15 files
 npm run selftest  # end-to-end: real CLI against a mock bridge
 zeke selftest     # same suite, from an installed checkout
 ```

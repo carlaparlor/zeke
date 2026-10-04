@@ -7,29 +7,31 @@
 // tool-call accuracy.
 
 import { renderSchema } from "../core/types.js";
-import { readFileSync } from "node:fs";
-import { paths } from "../lib/paths.js";
+import { formatProjectContext } from "./project.js";
+export { findProjectRoot, loadProjectContext, loadProjectPrompt } from "./project.js";
 
 /**
  * @param {object} input
  * @param {import("../core/types.js").Tool[]} input.tools
  * @param {string} input.cwd
- * @param {string} [input.projectPrompt]  contents of AGENTS.md / ZEKE.md
+ * @param {string} [input.projectPrompt]  applicable AGENTS.md / ZEKE.md instructions
+ * @param {import("./project.js").ProjectContext} [input.projectContext]
  * @param {string} [input.date]
  * @param {boolean} [input.headless]
  * @param {string} [input.model]
  */
-export function buildSystemPrompt({ tools, cwd, projectPrompt, date, headless, model }) {
+export function buildSystemPrompt({ tools, cwd, projectPrompt, projectContext, date, headless, model }) {
   const sections = [
     role({ headless, model }),
     toolPolicy(tools),
+    projectContext ? formatProjectContext(projectContext, cwd) : "",
     workflow(),
     delivery(),
     environment({ cwd, date }),
   ];
 
   if (projectPrompt?.trim()) {
-    sections.push(`<project-instructions>\nThe following are the user's project rules. They override anything above that they contradict.\n\n${projectPrompt.trim()}\n</project-instructions>`);
+    sections.push(`<project-instructions>\nThe following are the user's project rules. They override anything above that they contradict. More-local instruction files appear later and override only conflicting rules from earlier files.\n\n${projectPrompt.trim()}\n</project-instructions>`);
   }
 
   return sections.filter(Boolean).join("\n\n");
@@ -69,6 +71,7 @@ function toolPolicy(tools) {
     "# Exploration",
     "- Never open a file you guessed at. Find it with `glob` or `grep` first, then `read` the range you need.",
     "- Read before editing. If a tool fails or the file changed underneath you, re-read before acting.",
+    "- Before changing a subdirectory, inspect any more-local `ZEKE.md` or `AGENTS.md` that applies to those files.",
     "- Parallelize independent calls in one turn; sequence only genuine dependencies.",
   );
 
@@ -107,7 +110,7 @@ function workflow() {
     "1. Scope — understand the request before opening files. Plan multi-file work first.",
     "2. Research — read the relevant code and reuse what is there.",
     "3. Implement — make the change; keep it the smallest change that is actually correct.",
-    "4. Verify — run the thing. For non-trivial work never finish without exercising the changed path and observing real output; tests alone are not proof. A clean exit code is not a pass when the output is wrong.",
+    "4. Verify — use the detected project commands when available; run the narrowest relevant check, then the broader suite when practical. For non-trivial work exercise the changed path and inspect real output; tests alone are not proof, and a clean exit code is not a pass when output is wrong.",
     "5. Clean up — remove scaffolding, update the docs or changelog the repo expects, leave no dead code.",
   ].join("\n");
 }
@@ -131,21 +134,4 @@ function delivery() {
 
 function environment({ cwd, date }) {
   return ["§ Environment", `Working directory: ${cwd}`, `Date: ${date ?? new Date().toISOString().slice(0, 10)}`, "Paths in tool calls are relative to the working directory."].join("\n");
-}
-
-/**
- * Load the project's own instructions, if it has any.
- * ZEKE.md wins over AGENTS.md when both exist; neither is required.
- * @param {string} cwd
- */
-export function loadProjectPrompt(cwd) {
-  for (const file of [paths.zekeMd(cwd), paths.agentsMd(cwd)]) {
-    try {
-      const text = readFileSync(file, "utf8");
-      if (text.trim()) return { text, file };
-    } catch {
-      // absent is the normal case
-    }
-  }
-  return null;
 }

@@ -8,7 +8,7 @@
 import { EventBus, Events } from "../lib/events.js";
 import { createToolRegistry } from "../tools/index.js";
 import { createProvider } from "../providers/index.js";
-import { buildSystemPrompt, loadProjectPrompt } from "../prompts/system.js";
+import { buildSystemPrompt, loadProjectContext, loadProjectPrompt } from "../prompts/system.js";
 import { runAgent } from "./agent.js";
 import { SessionStore } from "../session/store.js";
 import { compact, shouldCompact } from "../session/compact.js";
@@ -52,6 +52,7 @@ export class ZekeRuntime {
   #tools;
   #provider;
   #projectPrompt;
+  #projectContext;
   /** Index into `messages` of the first entry not yet written to disk. */
   #persisted = 0;
 
@@ -76,6 +77,7 @@ export class ZekeRuntime {
     });
 
     this.#projectPrompt = loadProjectPrompt(this.cwd);
+    this.#projectContext = loadProjectContext(this.cwd);
 
     if (this.config.session.persist) {
       this.#session = new SessionStore({ cwd: this.cwd, model: this.config.model });
@@ -115,6 +117,7 @@ export class ZekeRuntime {
         tools: this.#tools.visible(),
         cwd: this.cwd,
         projectPrompt: this.#projectPrompt?.text,
+        projectContext: this.#projectContext,
         model: this.config.model,
         headless: this.headless,
       });
@@ -131,16 +134,50 @@ export class ZekeRuntime {
   clear() {
     this.#seedSystemPrompt();
     this.turns = 0;
+    this.usage = { inputTokens: 0, outputTokens: 0 };
+    this.sessionApproved.clear();
+  }
+
+  /** Start a distinct conversation, keeping the previous session on disk. */
+  async startNewSession() {
+    let store = null;
+    if (this.config.session.persist) {
+      store = new SessionStore({ cwd: this.cwd, model: this.config.model });
+      await store.open();
+    }
+
+    if (this.#session) {
+      this.events.emit(Events.SESSION_END, { id: this.#session.id, file: this.#session.file });
+    }
+    this.#seedSystemPrompt();
+    this.turns = 0;
+    this.usage = { inputTokens: 0, outputTokens: 0 };
+    this.sessionApproved.clear();
+    this.#session = store ?? undefined;
+    // The store contains only its metadata record so far; the system prompt is
+    // runtime configuration and is never persisted as a transcript message.
+    this.#persisted = this.messages.length;
+    if (!store) return null;
+
+    this.events.emit(Events.SESSION_START, { id: store.id, file: store.file, cwd: this.cwd });
+    return store;
   }
 
   /** Load a previous session's transcript. */
   async resume(id) {
     const store = await SessionStore.load(id, this.cwd);
     const history = store.messages();
+    if (this.#session && this.#session.id !== store.id) {
+      this.events.emit(Events.SESSION_END, { id: this.#session.id, file: this.#session.file });
+    }
     this.#session = store;
     this.messages = [{ role: "system", content: this.systemPrompt }, ...history];
+    this.turns = 0;
+    this.usage = { inputTokens: 0, outputTokens: 0 };
+    this.sessionApproved.clear();
     // Everything replayed is already on disk; only new turns get appended.
     this.#persisted = this.messages.length;
+    this.events.emit(Events.SESSION_START, { id: store.id, file: store.file, cwd: this.cwd });
     return store;
   }
 

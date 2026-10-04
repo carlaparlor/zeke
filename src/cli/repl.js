@@ -8,6 +8,7 @@ import { createInterface } from "node:readline";
 import { existsSync } from "node:fs";
 import { ZekeRuntime, deriveTitle } from "../core/runtime.js";
 import { createRenderer } from "../ui/render.js";
+import { createTerminalUI } from "../ui/tui.js";
 import { createApprovalPrompt } from "../ui/approve.js";
 import { style, stripAnsi, SYMBOLS, colorEnabled } from "../ui/ansi.js";
 import { displayPath, paths } from "../lib/paths.js";
@@ -25,14 +26,24 @@ import { Events } from "../lib/events.js";
  */
 export async function runInteractive({ config, flags, cwd, initialPrompt }) {
   const paint = config.ui.color === false ? plain() : style;
-  const out = process.stdout;
+  const terminalUI =
+    !flags["no-tui"] && process.stdin.isTTY && process.stdout.isTTY
+      ? createTerminalUI({ color: config.ui.color !== false && colorEnabled(process.stdout) })
+      : null;
+  // In TUI mode renderers, approval previews and command output write into the
+  // scrollback model. The screen itself is drawn only by TerminalUI.
+  const out = terminalUI?.logStream ?? process.stdout;
 
   const runtime = new ZekeRuntime({
     config,
     cwd,
     headless: false,
     systemPrompt: flags["system-prompt"],
-    approve: createApprovalPrompt({ stream: out, color: config.ui.color !== false }),
+    approve: createApprovalPrompt({
+      stream: out,
+      color: config.ui.color !== false,
+      ask: terminalUI ? (prompt) => terminalUI.askLine(prompt) : undefined,
+    }),
   });
 
   let renderer;
@@ -47,6 +58,30 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
 
   const write = (text = "") => out.write(`${text}\n`);
 
+  function syncTuiHeader() {
+    if (!terminalUI) return;
+    const usage = runtime.contextUsage();
+    terminalUI.setHeader({
+      model: runtime.config.model,
+      profile: runtime.config.profileName,
+      cwd: displayPath(cwd),
+      tools: runtime.tools?.names().length ?? 0,
+      approval: runtime.approvalMode,
+      session: runtime.session?.meta.title ?? runtime.session?.id ?? "ephemeral",
+      context: `${usage.percent}%`,
+      prompt: promptString(),
+    });
+  }
+
+  terminalUI?.setInterruptHandler(() => {
+    if (running) {
+      currentAbort?.abort();
+      write(paint.yellow("interrupted"));
+    } else {
+      terminalUI.close();
+    }
+  });
+
   try {
     await runtime.init();
   } catch (err) {
@@ -54,17 +89,25 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
     return 1;
   }
 
+  syncTuiHeader();
+  if (terminalUI) {
+    terminalUI.start();
+    terminalUI.attachEvents(runtime.events);
+  }
+
   renderer = createRenderer(runtime.events, {
     stream: out,
     color: config.ui.color !== false,
     verbose,
     thinking: config.ui.thinking,
-    spinner: config.ui.spinner !== false,
-    columns: () => out.columns ?? 100,
+    spinner: terminalUI ? false : config.ui.spinner !== false,
+    columns: () => process.stdout.columns ?? 100,
   });
 
-  // Keep the spinner out of the input line.
-  const rl = createInterface({
+  // TTY sessions use the full-screen keyboard UI. Piped/scripted sessions keep
+  // the line-oriented interface so automation and existing shell workflows
+  // remain predictable.
+  const rl = terminalUI ?? createInterface({
     input: process.stdin,
     output: out,
     terminal: true,
@@ -72,19 +115,22 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
     completer,
     historySize: 500,
   });
+  terminalUI?.setCompleter(completer);
+  terminalUI?.setPrompt(promptString());
 
   banner();
 
   if (flags.resume) {
     try {
       const store = await runtime.resume(flags.resume);
+      syncTuiHeader();
       write(paint.dim(`resumed ${flags.resume} (${store.messages().length} messages)`));
     } catch (err) {
       write(paint.red(`could not resume ${flags.resume}: ${err.message}`));
     }
   }
 
-  const ask = (question, options) => promptUser(question, options, { rl, paint });
+  const ask = (question, options) => promptUser(question, options, { rl, paint, terminalUI });
   runtime.askHandler = ask;
 
   // The renderer prints every model error the moment it arrives, so the turn
@@ -124,6 +170,8 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
     } finally {
       process.removeListener("SIGINT", onSigint);
       running = false;
+      currentAbort = null;
+      syncTuiHeader();
       rl.resume();
       rl.prompt();
     }
@@ -171,10 +219,11 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
         ["/tools", "list the tools the model can call"],
         ["/usage", "context and token usage"],
         ["/compact", "compress older context now"],
-        ["/clear", "start over, keeping the system prompt"],
+        ["/clear", "reset the current conversation, keeping the system prompt"],
+        ["/new", "start a separate session (Ctrl+N)"],
         ["/session", "show the current session id and file"],
-        ["/sessions", "list saved sessions for this directory"],
-        ["/resume <id>", "load a saved session"],
+        ["/sessions", "browse saved sessions (Ctrl+R)"],
+        ["/resume [id]", "resume a session, or open the picker"],
         ["/export [file]", "write the transcript to a markdown file"],
         ["/bridge [action]", "status, or start|stop|restart|logs|models"],
         ["/doctor", "run the full diagnostic"],
@@ -193,6 +242,7 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
         return;
       }
       runtime.config.model = arg.trim();
+      syncTuiHeader();
       write(`${paint.green(SYMBOLS.check)} model → ${arg.trim()}`);
     },
 
@@ -210,12 +260,14 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
         thinkingEffort: profile.thinkingEffort,
         maxTokens: profile.maxTokens ?? runtime.config.maxTokens,
       });
+      syncTuiHeader();
       write(`${paint.green(SYMBOLS.check)} profile → ${name} (model ${runtime.config.model})`);
     },
 
     think: (arg) => {
       const on = arg ? ["on", "true", "1", "yes"].includes(arg.trim().toLowerCase()) : !runtime.config.thinking;
       runtime.config.thinking = on;
+      syncTuiHeader();
       write(`${paint.green(SYMBOLS.check)} thinking ${on ? "on" : "off"}`);
     },
 
@@ -246,6 +298,7 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
       }
       runtime.approvalMode = mode;
       runtime.sessionApproved.clear();
+      syncTuiHeader();
       write(`${paint.green(SYMBOLS.check)} approval mode → ${mode}`);
     },
 
@@ -279,7 +332,18 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
 
     clear: () => {
       runtime.clear();
-      write(`${paint.green(SYMBOLS.check)} new conversation`);
+      syncTuiHeader();
+      write(`${paint.green(SYMBOLS.check)} conversation reset (current session kept)`);
+    },
+
+    new: async () => {
+      const session = await runtime.startNewSession();
+      syncTuiHeader();
+      write(
+        session
+          ? `${paint.green(SYMBOLS.check)} new session ${session.id}`
+          : `${paint.green(SYMBOLS.check)} new conversation (session persistence is off)`,
+      );
     },
 
     session: () => {
@@ -306,13 +370,14 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
     },
 
     resume: async (arg) => {
-      const id = arg.trim();
+      let id = arg.trim();
       if (!id) {
-        write(paint.red("usage: /resume <id>  (see /sessions)"));
-        return;
+        id = await pickSession();
+        if (!id) return;
       }
       try {
         const store = await runtime.resume(id);
+        syncTuiHeader();
         write(`${paint.green(SYMBOLS.check)} resumed ${id} (${store.messages().length} messages)`);
       } catch (err) {
         write(paint.red(err.message));
@@ -334,7 +399,7 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
         if (action === "start" || action === "restart") {
           write(paint.dim(`bringing the bridge up on ${runtime.config.bridge.host}:${runtime.config.bridge.port}…`));
         }
-        await bridgeCommand({ flags: {}, positional: [action, ...rest], config: runtime.config });
+        await bridgeCommand({ flags: {}, positional: [action, ...rest], config: runtime.config, output: out });
         return;
       }
       const state = await bridgeHealth(runtime.config.bridge);
@@ -355,7 +420,7 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
 
     doctor: async () => {
       const { doctorCommand } = await import("./doctor.js");
-      await doctorCommand({ flags: {}, positional: [], config: runtime.config });
+      await doctorCommand({ flags: {}, positional: [], config: runtime.config, output: out });
     },
 
     plugins: async () => {
@@ -384,6 +449,38 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
     q: () => rl.close(),
   };
 
+  async function pickSession() {
+    const sessions = await SessionStore.list(cwd);
+    if (!sessions.length) {
+      write(paint.dim("no saved sessions for this directory yet"));
+      return "";
+    }
+    if (!terminalUI) {
+      write(paint.dim("usage: /resume <id>  (see /sessions)"));
+      await commands.sessions();
+      return "";
+    }
+    const options = sessions.map((session) => ({
+      label: session.title || "(untitled session)",
+      description: `${session.id} · ${new Date(session.mtimeMs).toISOString().slice(0, 16).replace("T", " ")}`,
+      value: session.id,
+    }));
+    return (await terminalUI.select("Choose a session to resume", options)) ?? "";
+  }
+
+  terminalUI?.setShortcutHandler(async (shortcut) => {
+    rl.pause();
+    try {
+      if (shortcut === "sessions") await commands.resume("");
+      else if (shortcut === "new-session") await commands.new("");
+    } catch (err) {
+      write(paint.red(err.message));
+    } finally {
+      rl.resume();
+      rl.prompt();
+    }
+  });
+
   function usage_() {
     return runtime.session?.id ?? "ephemeral";
   }
@@ -402,7 +499,7 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
     write(`  ${paint.dim(`${displayPath(cwd)} · ${runtime.tools.names().length} tools · approvals ${runtime.approvalMode}`)}`);
     if (runtime.session) write(`  ${paint.dim(`session ${runtime.session.id}`)}`);
     if (runtime.plugins.length) write(`  ${paint.dim(`plugins: ${runtime.plugins.map((p) => p.name).join(", ")}`)}`);
-    write(`  ${paint.dim("type /help for commands, ctrl-d to quit")}`);
+    write(`  ${paint.dim(terminalUI ? "Enter send · Ctrl+R sessions · Ctrl+N new session · Ctrl+C interrupt/quit · /help" : "type /help for commands, ctrl-d to quit")}`);
     write("");
   }
 
@@ -448,7 +545,13 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
 
   renderer.dispose();
   await runtime.close();
-  write(paint.dim(`session saved: ${runtime.session?.file ?? "(none)"}`));
+  const savedMessage = paint.dim(`session saved: ${runtime.session?.file ?? "(none)"}`);
+  if (terminalUI) {
+    terminalUI.destroy();
+    process.stdout.write(`\r\n${savedMessage}\r\n`);
+  } else {
+    write(savedMessage);
+  }
   return exitCode;
 }
 
@@ -463,7 +566,9 @@ async function forceCompact(runtime) {
 }
 
 /** Ask the user a question on behalf of the `ask` tool. */
-async function promptUser(question, options, { rl, paint }) {
+async function promptUser(question, options, { rl, paint, terminalUI }) {
+  if (terminalUI) return terminalUI.ask(question, options);
+
   rl.pause();
   process.stdout.write(`\n${paint.yellow("?")} ${paint.bold(question)}\n`);
   (options ?? []).forEach((option, i) => {

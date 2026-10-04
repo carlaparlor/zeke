@@ -13,10 +13,10 @@ const ACTIONS = ["start", "stop", "restart", "status", "logs", "models"];
  * @param {{flags: any, positional: string[], config: any}} ctx
  * @returns {Promise<number>}
  */
-export async function bridgeCommand({ flags, positional, config }) {
+export async function bridgeCommand({ flags, positional, config, output = process.stdout }) {
   const paint = flags.quiet ? plain() : style;
   const action = positional[0] ?? "status";
-  const out = (text = "") => process.stdout.write(`${text}\n`);
+  const out = (text = "") => output.write(`${text}\n`);
 
   if (!ACTIONS.includes(action)) {
     out(`${paint.red(`unknown action "${action}"`)} — expected one of ${ACTIONS.join(", ")}`);
@@ -27,7 +27,7 @@ export async function bridgeCommand({ flags, positional, config }) {
 
   if (action === "start") {
     try {
-      const started = await startBridge({ ...bridgeConfig, logStream: flags.follow ? process.stdout : undefined });
+      const started = await startBridge({ ...bridgeConfig, logStream: flags.follow ? output : undefined });
       out(`${paint.green("✓")} bridge on ${started.url} (pid ${started.pid})`);
       out(paint.dim(`  agent mode: ${config.bridge.agentMode !== false ? "on (tool calling enabled)" : "OFF — tools will be ignored"}`));
       out(paint.dim(`  log: ${started.logFile}`));

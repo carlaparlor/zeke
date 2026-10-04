@@ -46,6 +46,21 @@ describe("text matching", () => {
     assert.ok(match.similarity > 0.8);
   });
 
+  test("fuzzy matching refuses two equally plausible edit locations", () => {
+    const source = `function first() {
+  return value.trim();
+}
+
+function first() {
+  return value.trim();
+}`;
+    const needle = ["function first() {", "  return value.trimmed();", "}"].join(String.fromCharCode(10));
+    const match = findMatch(source, needle);
+    assert.equal(match.ok, false);
+    assert.match(match.problems.join(" "), /fuzzy oldText is close to 2 places/);
+    assert.deepEqual(match.candidates.map((candidate) => candidate.line), [1, 5]);
+  });
+
   test("a near miss explains itself instead of failing silently", () => {
     const match = findMatch(source, "function farewell(name) {\n  return `bye ${name}`;\n}");
     assert.equal(match.ok, false);
@@ -267,6 +282,23 @@ describe("file tools", () => {
     );
   });
 
+  test("edit leaves the file untouched when fuzzy matches have competing locations", async () => {
+    const before = `function first() {
+  return value.trim();
+}
+
+function first() {
+  return value.trim();
+}`;
+    await box.write("fuzzy-ambiguous.js", before);
+    const oldText = ["function first() {", "  return value.trimmed();", "}"].join(String.fromCharCode(10));
+    await assert.rejects(
+      () => editTool.execute({ path: "fuzzy-ambiguous.js", oldText, newText: "changed" }, ctx),
+      /fuzzy oldText is close to 2 places/,
+    );
+    assert.equal(await box.read("fuzzy-ambiguous.js"), before);
+  });
+
   test("edit rejects an ambiguous oldText rather than guessing", async () => {
     await box.write("e8.js", "dup\ndup\n");
     await assert.rejects(() => editTool.execute({ path: "e8.js", oldText: "dup", newText: "x" }, ctx), /2 places/);
@@ -369,6 +401,29 @@ describe("file tools", () => {
     const result = await bashTool.execute({ command: "sleep 30", timeout: 1000 }, ctx);
     assert.equal(result.details.timedOut, true);
     assert.match(result.content, /killed after 1000 ms/);
+  });
+
+  test("bash timeout also kills descendants left behind by the shell", async () => {
+    const { access } = await import("node:fs/promises");
+    const marker = `${box.cwd}/late-child.txt`;
+    const result = await bashTool.execute(
+      { command: `(sleep 1.5; printf late > '${marker}') & wait`, timeout: 1000 },
+      ctx,
+    );
+    assert.equal(result.details.timedOut, true);
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    await assert.rejects(() => access(marker), { code: "ENOENT" });
+  });
+
+  test("bash abort interrupts the command process group", async () => {
+    const controller = new AbortController();
+    const task = bashTool.execute({ command: "sleep 30" }, toolContext(box.cwd, { signal: controller.signal }));
+    setTimeout(() => controller.abort(), 50);
+    const result = await task;
+    assert.equal(result.details.aborted, true);
+    assert.equal(result.details.killed, true);
+    assert.equal(result.details.timedOut, false);
+    assert.match(result.content, /interrupted/);
   });
 
   test("bash clamps an absurdly small timeout up to the 1s floor", async () => {

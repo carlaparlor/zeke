@@ -7,7 +7,7 @@ import { SessionStore } from "../src/session/store.js";
 import { compact, shouldCompact, extractiveSummary } from "../src/session/compact.js";
 import { renderTranscript } from "../src/session/export.js";
 import { evaluateApproval, isReadOnlyCommand, isDangerousCommand } from "../src/core/approval.js";
-import { buildSystemPrompt, loadProjectPrompt } from "../src/prompts/system.js";
+import { buildSystemPrompt, loadProjectContext, loadProjectPrompt } from "../src/prompts/system.js";
 import { startMockBridge, scripted } from "../src/mock-bridge/server.js";
 import { createToolRegistry } from "../src/tools/index.js";
 import { readFile, writeFile, stat } from "node:fs/promises";
@@ -391,6 +391,77 @@ describe("system prompt", () => {
     }
   });
 
+  test("loadProjectPrompt combines repo and scoped instructions from root to leaf", async () => {
+    const box = await sandbox();
+    try {
+      await box.write(".git/HEAD", "ref: refs/heads/main");
+      await box.write("AGENTS.md", "root rules");
+      await box.write("src/AGENTS.md", "superseded source rules");
+      await box.write("src/ZEKE.md", "source rules");
+      await box.write("src/deep/AGENTS.md", "deep rules");
+      const loaded = loadProjectPrompt(path.join(box.cwd, "src", "deep"));
+      assert.deepEqual(loaded.files.map((file) => path.relative(box.cwd, file)), ["AGENTS.md", "src/ZEKE.md", "src/deep/AGENTS.md"]);
+      assert.ok(loaded.text.indexOf("root rules") < loaded.text.indexOf("source rules"));
+      assert.ok(loaded.text.indexOf("source rules") < loaded.text.indexOf("deep rules"));
+      assert.doesNotMatch(loaded.text, /superseded source rules/);
+    } finally {
+      await box.cleanup();
+    }
+  });
+
+  test("project context detects package scripts and shows them as verification hints", async () => {
+    const box = await sandbox();
+    try {
+      await box.write(".git/HEAD", "ref: refs/heads/main");
+      await box.write(
+        "package.json",
+        JSON.stringify({
+          name: "sample-app",
+          packageManager: "pnpm@9.0.0",
+          scripts: { test: "node --test", lint: "eslint .", typecheck: "tsc --noEmit", build: "vite build" },
+        }),
+      );
+      const context = loadProjectContext(box.cwd);
+      assert.equal(context.root, box.cwd);
+      assert.equal(context.packageName, "sample-app");
+      assert.deepEqual(context.types, ["Node.js"]);
+      assert.deepEqual(context.checks.map((check) => [check.kind, check.command]), [
+        ["tests", "pnpm test"],
+        ["lint", "pnpm run lint"],
+        ["type/check", "pnpm run typecheck"],
+        ["build", "pnpm run build"],
+      ]);
+
+      const prompt = buildSystemPrompt({ tools, cwd: box.cwd, projectContext: context });
+      assert.match(prompt, /<project-context>/);
+      assert.match(prompt, /pnpm test/);
+      assert.match(prompt, /not run automatically/);
+      assert.match(prompt, /narrowest relevant check/);
+    } finally {
+      await box.cleanup();
+    }
+  });
+
+  test("project context recognizes conventional Go, Rust, Python and Make tests", async () => {
+    const cases = [
+      { file: "go.mod", contents: "module example.test/project", type: "Go", command: "go test ./..." },
+      { file: "Cargo.toml", contents: "[package]", type: "Rust", command: "cargo test" },
+      { file: "pyproject.toml", contents: "[tool.pytest.ini_options]", type: "Python", command: "python -m pytest" },
+      { file: "Makefile", contents: "test:", type: null, command: "make test" },
+    ];
+    for (const item of cases) {
+      const box = await sandbox();
+      try {
+        await box.write(item.file, item.contents);
+        const context = loadProjectContext(box.cwd);
+        if (item.type) assert.ok(context.types.includes(item.type));
+        assert.ok(context.checks.some((check) => check.command === item.command), `${item.file} should suggest ${item.command}`);
+      } finally {
+        await box.cleanup();
+      }
+    }
+  });
+
   test("loadProjectPrompt returns null when there is nothing", async () => {
     const box = await sandbox();
     try {
@@ -457,11 +528,13 @@ describe("runtime end to end", () => {
     const bridge = await startMockBridge();
     try {
       await box.write("ZEKE.md", "never touch the vendor directory");
+      await box.write("package.json", JSON.stringify({ scripts: { test: "node --test" } }));
       const config = await loadConfig({ cwd: box.cwd, overrides: { baseUrl: bridge.baseUrl, apiKey: "Waguri" } });
       const runtime = new ZekeRuntime({ config, cwd: box.cwd });
       await runtime.init();
       assert.match(runtime.systemPrompt, /never touch the vendor directory/);
       assert.match(runtime.systemPrompt, /§ Tool Policy/);
+      assert.match(runtime.systemPrompt, /npm test/);
       assert.ok(runtime.tools.has("edit"));
     } finally {
       await bridge.close();
@@ -482,6 +555,33 @@ describe("runtime end to end", () => {
       runtime.clear();
       assert.equal(runtime.messages.length, 1);
       assert.equal(runtime.systemPrompt, prompt);
+    } finally {
+      await bridge.close();
+      await box.cleanup();
+    }
+  });
+
+  test("startNewSession keeps the old transcript and starts a separate persistent session", async () => {
+    const box = await sandbox();
+    const bridge = await startMockBridge();
+    try {
+      const config = await loadConfig({ cwd: box.cwd, overrides: { baseUrl: bridge.baseUrl, apiKey: "Waguri" } });
+      const runtime = new ZekeRuntime({ config, cwd: box.cwd });
+      await runtime.init();
+      await runtime.run("keep this conversation");
+      const previous = runtime.session;
+      const previousId = previous.id;
+
+      const next = await runtime.startNewSession();
+      assert.ok(next);
+      assert.notEqual(next.id, previousId);
+      assert.equal(runtime.messages.length, 1);
+      assert.deepEqual(runtime.usage, { inputTokens: 0, outputTokens: 0 });
+      assert.deepEqual((await SessionStore.load(previousId, box.cwd)).messages().map((message) => message.content).filter(Boolean).slice(-2), [
+        "keep this conversation",
+        "mock reply to: keep this conversation",
+      ]);
+      assert.deepEqual(next.messages(), []);
     } finally {
       await bridge.close();
       await box.cleanup();

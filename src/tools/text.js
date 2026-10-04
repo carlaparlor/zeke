@@ -7,10 +7,14 @@
 //
 //   1. exact substring
 //   2. unique-after-whitespace-normalisation
-//   3. sliding-window fuzzy match over lines (word-level similarity)
+//   3. a high-confidence, uniquely best fuzzy match over lines
 //
-// and reports *why* a match failed (0 hits vs N hits vs a near miss), which is
+// Ambiguous near-ties are rejected rather than guessed, and the matcher
+// reports *why* a match failed (0 hits vs N hits vs a near miss), which is
 // what lets the model fix itself instead of guessing again.
+
+const FUZZY_ANCHOR_THRESHOLD = 0.35;
+const FUZZY_AMBIGUITY_MARGIN = 0.025;
 
 /**
  * @typedef {object} MatchResult
@@ -70,6 +74,13 @@ export function findMatch(source, needle, opts = {}) {
 
   // 3. Fuzzy sliding window over lines.
   const fuzzy = findFuzzyMatch(source, needle, minSimilarity);
+  if (fuzzy?.ambiguous) {
+    return {
+      ok: false,
+      problems: [...problems, `fuzzy oldText is close to ${fuzzy.count} places — re-read the file and include more surrounding lines`],
+      candidates: fuzzy.candidates,
+    };
+  }
   if (fuzzy?.ok) return { ...fuzzy, kind: "fuzzy" };
 
   if (fuzzy?.best && fuzzy.best.similarity >= 0.3) {
@@ -167,7 +178,8 @@ function offsetOfLine(source, lineIndex) {
 function findFuzzyMatch(source, needle, minSimilarity) {
   const sourceLines = source.split("\n");
   const needleLines = needle.split("\n").length;
-  let best = null;
+  const anchor = normalizeWhitespace(needle.split("\n").find((line) => line.trim()) ?? needle);
+  const bestByLine = new Map();
 
   const deltas = [0, 1, -1, 2, -2, 3, -3];
   for (let i = 0; i < sourceLines.length; i++) {
@@ -176,21 +188,38 @@ function findFuzzyMatch(source, needle, minSimilarity) {
       if (size < 1 || i + size > sourceLines.length) continue;
       const window = sourceLines.slice(i, i + size).join("\n");
       const similarity = bigramSimilarity(normalizeWhitespace(window), normalizeWhitespace(needle));
-      if (!best || similarity > best.similarity) {
-        const start = offsetOfLine(source, i);
-        best = {
-          similarity,
-          start,
-          end: start + window.length,
-          matched: window,
-          line: i + 1,
-          preview: sourceLines[i].trim().slice(0, 72),
-        };
-      }
+      const anchorSimilarity = bigramSimilarity(normalizeWhitespace(sourceLines[i]), anchor);
+      if (anchorSimilarity < FUZZY_ANCHOR_THRESHOLD) continue;
+      const start = offsetOfLine(source, i);
+      const candidate = {
+        similarity,
+        start,
+        end: start + window.length,
+        matched: window,
+        line: i + 1,
+        preview: sourceLines[i].trim().slice(0, 72),
+      };
+      const previous = bestByLine.get(start);
+      if (!previous || similarity > previous.similarity) bestByLine.set(start, candidate);
     }
   }
 
+  const ranked = [...bestByLine.values()].sort((a, b) => b.similarity - a.similarity || a.line - b.line);
+  const best = ranked[0];
   if (best && best.similarity >= minSimilarity) {
+    // A high score is not enough if another distinct location is nearly as
+    // good. Choosing between similar blocks is a guess, so make the caller
+    // add context or re-read instead of silently editing either one.
+    const competing = ranked.filter(
+      (candidate) => candidate.start !== best.start && candidate.similarity >= minSimilarity && best.similarity - candidate.similarity <= FUZZY_AMBIGUITY_MARGIN,
+    );
+    if (competing.length) {
+      return {
+        ambiguous: true,
+        count: competing.length + 1,
+        candidates: [best, ...competing].slice(0, 5).map(({ line, preview }) => ({ line, preview })),
+      };
+    }
     const { similarity, start, end, matched } = best;
     return { ok: true, start, end, matched, similarity };
   }
