@@ -1061,7 +1061,9 @@ export class TerminalUI {
       for (const row of visible) lines.push(fitToWidth(` ${row} `, width));
       cursor = {
         row: Math.max(1, Math.min(height, composerStart + cursorPos.row - start)),
-        col: Math.max(1, Math.min(width, cursorPos.col + 1)),
+        // Composer rows are indented by one cell, then terminal coordinates are
+        // one-based: account for both offsets so the caret sits after typed text.
+        col: Math.max(1, Math.min(width, cursorPos.col + 2)),
         visible: !this.paused || Boolean(this.promptState),
       };
     }
