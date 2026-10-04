@@ -1,7 +1,9 @@
 // `zeke bridge …` — control the bridge process.
 
 import { paths } from "../lib/paths.js";
-import { bridgeConfigFrom, health as bridgeHealth, listBridgeModels, readLogTail, readPid, restartBridge, startBridge, stopBridge } from "../bridge/bridge.js";
+import { bridgeConfigFrom, health as bridgeHealth, listBridgeModels, readBridgeState, readLogTail, readPid, restartBridge, startBridge, stopBridge } from "../bridge/bridge.js";
+import { egressProxyUrl, ensureEgress } from "../bridge/egress.js";
+import { proxyOverview } from "../bridge/proxy.js";
 import { keeperStatus, startKeeper, stopKeeper, describeKeeperState } from "../bridge/keeper.js";
 import { style } from "../ui/ansi.js";
 
@@ -23,7 +25,7 @@ export async function bridgeCommand({ flags, positional, config, output = proces
     return 2;
   }
 
-  const bridgeConfig = bridgeConfigFrom(config);
+  const bridgeConfig = await resolveBridgeConfig(config);
 
   if (action === "start") {
     try {
@@ -31,6 +33,7 @@ export async function bridgeCommand({ flags, positional, config, output = proces
       out(`${paint.green("✓")} bridge on ${started.url} (pid ${started.pid})`);
       out(paint.dim(`  agent mode: ${config.bridge.agentMode !== false ? "on (tool calling enabled)" : "OFF — tools will be ignored"}`));
       out(paint.dim(`  log: ${started.logFile}`));
+      if (bridgeConfig.proxyUrl) out(paint.dim(`  egress: tunnelling through ${bridgeConfig.egressProxy ?? bridgeConfig.proxyUrl}`));
       const state = await bridgeHealth(bridgeConfig);
       if (!state.healthy) {
         out(paint.yellow("  ! it is listening but has no Z.AI session yet — see `zeke doctor`"));
@@ -90,6 +93,12 @@ export async function bridgeCommand({ flags, positional, config, output = proces
       const pool = state.status.sessionPool;
       out(`  pool     ${pool.ready}/${pool.size} ready`);
     }
+    if (config.bridge.proxy?.enabled === true) {
+      const overview = await proxyOverview(config);
+      const bridgeState = await readBridgeState();
+      const upstream = bridgeState?.proxyUrl ? overview.relay.current ?? paint.yellow("no proxy yet (falling back)") : paint.yellow("direct — restart the bridge");
+      out(`  egress   ${overview.relay.running ? `${upstream} via 127.0.0.1:${overview.relay.port} (${overview.candidates.length} proxies ready)` : paint.red("relay not running — `zeke proxy on`")}`);
+    }
     out(`  binary   ${config.bridge.binary ?? paths.bridgeBinary()}`);
     return state.listening ? 0 : 1;
   }
@@ -117,6 +126,26 @@ export async function bridgeCommand({ flags, positional, config, output = proces
 }
 
 
+
+/**
+ * A bridge config that carries the egress relay's URL when proxying is on.
+ * A relay that will not start is not an error here: the bridge then starts
+ * without the proxy env, which is exactly the behaviour proxying off has.
+ */
+async function resolveBridgeConfig(config) {
+  const bridgeConfig = bridgeConfigFrom(config);
+  if (config.bridge?.proxy?.enabled !== true) return bridgeConfig;
+  try {
+    const relay = await ensureEgress(config);
+    if (relay.running && relay.port) {
+      bridgeConfig.proxyUrl = egressProxyUrl(relay.port);
+      bridgeConfig.egressProxy = relay.state?.current ?? null;
+    }
+  } catch {
+    // reported by `zeke proxy status` / `zeke doctor` instead
+  }
+  return bridgeConfig;
+}
 
 function plain() {
   return new Proxy({}, { get: () => (text) => String(text) });

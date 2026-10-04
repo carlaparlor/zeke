@@ -62,6 +62,36 @@ export const DEFAULTS = Object.freeze({
     harvest: { tokens: 500, batch: 2, parallel: 1 }, // flags for the collector
     sessionPoolSize: 5,
     sessionReuseCount: 10,
+    // Free-proxy egress (src/bridge/proxy.js). chat.z.ai's WAF blocks the
+    // *IP*, so the only immediate fix is a different IP; this is where the
+    // pool, the rotation policy and the local relay the bridge tunnels
+    // through are configured. Off by default: it is opt-in, and `zeke proxy
+    // on` flips it on with a pool already probed.
+    proxy: {
+      enabled: false,
+      port: 3010, // the relay's loopback port (falls back to an ephemeral one)
+      url: null, // pin one proxy (http://host:port) instead of the pool
+      rotate: "on-block", // "on-block" (default) | "per-request"
+      protocol: "http", // proxifly list to draw from
+      country: null, // ISO code, e.g. "US"
+      mirror: "cdn", // "cdn" (jsDelivr) | "raw" (GitHub)
+      listUrl: null, // download from here instead of the mirrors (any Proxifly-shaped JSON)
+      hosts: ["chat.z.ai"], // upstreams to tunnel; everything else goes direct
+      fallbackDirect: true, // connect directly when no proxy answers
+      validate: true, // probe each candidate before it joins the pool
+      maxFailures: 2, // proxy failures before it leaves the pool
+      attempts: 3, // proxies tried per connection before falling back
+      maxRotationsPerBlock: 5, // keeper: rotations while one WAF block lasts
+      rotateIntervalSeconds: 45, // keeper: minimum gap between rotations
+      pool: {
+        count: 8, // validated proxies to keep ready
+        maxCandidates: 24, // cap on the validated list written to the plan
+        maxChecked: 48, // probe budget per refill
+        concurrency: 4,
+        refreshSeconds: 900, // re-fetch the Proxifly list at most this often
+        validateTimeoutMs: 6000,
+      },
+    },
   },
   approval: {
     mode: "auto", // "ask" | "auto" | "yolo"

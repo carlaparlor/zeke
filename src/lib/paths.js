@@ -42,6 +42,17 @@ export const paths = {
   tokenDb: () => path.join(zekeHome(), "tokens.sqlite"),
   bridgePid: () => path.join(zekeHome(), "bridge.pid"),
   bridgeLog: () => path.join(zekeHome(), "logs", "bridge.log"),
+  // What the running bridge was started with, so `zeke doctor` and the keeper
+  // can tell whether it is already tunnelling through the egress relay.
+  bridgeState: () => path.join(zekeHome(), "bridge.json"),
+  // The free-proxy pool: `proxy.json` is the plan the egress relay executes,
+  // `proxies.json` is the cached Proxifly list, `egress.json` is the relay's
+  // own view of the world (pid, port, current proxy, counters).
+  proxyPlan: () => path.join(zekeHome(), "proxy.json"),
+  proxyCache: () => path.join(zekeHome(), "proxies.json"),
+  egressPid: () => path.join(zekeHome(), "egress.pid"),
+  egressState: () => path.join(zekeHome(), "egress.json"),
+  egressLog: () => path.join(zekeHome(), "logs", "egress.log"),
   keeperPid: () => path.join(zekeHome(), "keeper.pid"),
   keeperState: () => path.join(zekeHome(), "keeper.json"),
   keeperLog: () => path.join(zekeHome(), "logs", "keeper.log"),

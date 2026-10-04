@@ -8,6 +8,7 @@ import { runInteractive } from "./repl.js";
 import { runHeadless } from "./headless.js";
 import { setupCommand } from "./setup.js";
 import { bridgeCommand } from "./bridge-cli.js";
+import { proxyCommand, PROXY_FLAGS } from "./proxy-cli.js";
 import { doctorCommand } from "./doctor.js";
 import { tokensCommand } from "./tokens.js";
 import { configCommand } from "./config-cli.js";
@@ -43,6 +44,13 @@ const GLOBAL_SPEC = {
 const COMMANDS = {
   setup: { describe: "Build the bridge and configure tokens (start here)", run: setupCommand },
   bridge: { describe: "Manage the GLM-Free-API bridge process", run: bridgeCommand },
+  proxy: {
+    describe: "Tunnel the bridge through a rotating free proxy when the WAF blocks its IP",
+    run: proxyCommand,
+    // Flags that belong to this subcommand only: merged into the global spec
+    // for `zeke proxy …` runs, and hidden from the global help.
+    flags: PROXY_FLAGS,
+  },
   doctor: { describe: "Diagnose the whole toolchain", run: doctorCommand },
   tokens: { describe: "Harvest, inspect and hot-swap device tokens", run: tokensCommand },
   config: { describe: "Read and write zeke's configuration", run: configCommand },
@@ -65,7 +73,8 @@ export async function main(argv) {
 
   let parsed;
   try {
-    parsed = parseArgs(isCommand ? argv.slice(1) : argv, GLOBAL_SPEC);
+    const spec = isCommand ? { ...GLOBAL_SPEC, ...(COMMANDS[first].flags ?? {}) } : GLOBAL_SPEC;
+    parsed = parseArgs(isCommand ? argv.slice(1) : argv, spec);
   } catch (err) {
     console.error(`zeke: ${err.message}`);
     return 2;
@@ -81,6 +90,12 @@ export async function main(argv) {
   if (flags.help || first === "help") {
     console.log(usage());
     return 0;
+  }
+
+  if (first === "__egress") {
+    // Hidden entry point: the detached egress relay (bridge/egress.js).
+    const { egressMain } = await import("../bridge/egress.js");
+    return egressMain();
   }
 
   if (first === "__keeper") {
@@ -155,6 +170,7 @@ async function upkeep(config) {
  */
 const IN_SESSION = {
   bridge: "/bridge",
+  proxy: "/proxy",
   doctor: "/doctor",
   tools: "/tools",
   sessions: "/sessions",
@@ -208,6 +224,12 @@ async function readStdin() {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/** The global flags, minus the ones that belong to a single subcommand. */
+function globalHelpSpec() {
+  const owned = new Set(Object.values(COMMANDS).flatMap((command) => Object.keys(command.flags ?? {})));
+  return Object.fromEntries(Object.entries(GLOBAL_SPEC).filter(([name]) => !owned.has(name)));
+}
+
 function usage() {
   return [
     "zeke — a terminal coding agent for GLM-Free-API",
@@ -231,11 +253,12 @@ function usage() {
       .filter(([, c]) => c.run)
       .map(([name, c]) => `  ${name.padEnd(12)}${c.describe}`),
     "",
-    renderHelp(GLOBAL_SPEC, { title: "" }),
+    renderHelp(globalHelpSpec(), { title: "" }),
     "Examples:",
     "  zeke setup --token <jwt>    non-interactive setup with a chat.z.ai JWT",
     "  zeke bridge start           start the bridge (agent mode on)",
     "  zeke tokens swap db.sqlite  hot-swap a freshly harvested token database",
+    "  zeke proxy on --country US  tunnel through a free proxy when the WAF blocks this IP",
     "  zeke -p --yolo \"run the tests and fix what fails\"",
     "",
   ]

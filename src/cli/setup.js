@@ -14,6 +14,7 @@ import { maskSecret, saveSecrets } from "../config/index.js";
 import { buildBridge, ensureVendored, findGo, sourceFingerprint, writeBuildInfo, UPSTREAM_REPO } from "../bridge/build.js";
 import { collectReadiness, harvestTokens } from "../bridge/collector.js";
 import { bridgeBaseUrl, health as bridgeHealth, startBridge, stopBridge, swapTokenDb } from "../bridge/bridge.js";
+import { egressProxyUrl, ensureEgress } from "../bridge/egress.js";
 import { createGlmProvider, GLM_MODEL_PRESETS } from "../providers/glm.js";
 import { style } from "../ui/ansi.js";
 
@@ -163,6 +164,17 @@ export async function setupCommand({ flags, config }) {
   } else if (!binary && !config.bridge.binary) {
     warn("nothing to start — the bridge was not built");
   } else {
+    // Proxying is opt-in, but if it is already on, the bridge must be born
+    // through the relay — otherwise this restart would quietly drop it back
+    // onto the egress IP the user configured it to avoid.
+    if (config.bridge?.proxy?.enabled === true) {
+      try {
+        const relay = await ensureEgress(config);
+        if (relay.running && relay.port) bridgeConfig.proxyUrl = egressProxyUrl(relay.port);
+      } catch (err) {
+        warn(`the egress relay did not start (${err.message}) — starting the bridge directly`);
+      }
+    }
 
     const before = await bridgeHealth(bridgeConfig);
     if (before.listening) {
