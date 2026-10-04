@@ -192,6 +192,20 @@ describe("full-screen terminal UI", () => {
     terminal.ui.destroy();
   });
 
+  test("keeps the visible insertion cursor after typed text", () => {
+    const terminal = fakeTerminal();
+
+    assert.equal(terminal.ui.cursorCell.col, 2, "the empty composer cursor starts after its left padding");
+    terminal.key("a", { name: "a" });
+    assert.equal(terminal.ui.cursorCell.col, 3, "the cursor follows the first typed character");
+    terminal.key("b", { name: "b" });
+    assert.equal(terminal.ui.cursorCell.col, 4, "the cursor follows subsequent characters");
+    terminal.key("", { name: "left" });
+    assert.equal(terminal.ui.cursorCell.col, 3, "moving left places the cursor before the last character");
+
+    terminal.ui.destroy();
+  });
+
   test("uses an editable composer and yields submitted prompts through its async iterator", async () => {
     const terminal = fakeTerminal();
     const iterator = terminal.ui[Symbol.asyncIterator]();
