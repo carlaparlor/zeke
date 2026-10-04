@@ -32,6 +32,13 @@ const PARALLEL_LIMIT = 4;
  * @property {number} [maxTurns]
  * @property {number} [parallelLimit]
  * @property {(text: string) => void} [output]
+ * @property {() => (import("../core/types.js").Message|null|undefined)[]} [asides]
+ *   Nudges polled at every turn boundary. Evaluated *at injection time*, so a
+ *   turn that just touched `todo` can suppress the nudge it had earned.
+ * @property {(results: import("../core/types.js").Message[]) => (import("../core/types.js").Message|null|undefined)[]} [afterToolResults]
+ *   Called once per tool batch, after the results have been appended. Returned
+ *   messages are appended too — how a correction rides behind the result it
+ *   is correcting.
  */
 
 /**
@@ -61,6 +68,15 @@ export async function runAgent(messages, deps, options = {}) {
     if (signal?.aborted) {
       stopped = "aborted";
       break;
+    }
+
+    // Session-level nudges (todo reminders) are pulled here rather than queued
+    // earlier, so they always describe the state as it is *now* — see the
+    // `asides` note in AgentDeps.
+    if (turns > 1 && deps.asides) {
+      for (const aside of deps.asides() ?? []) {
+        if (aside) messages.push(aside);
+      }
     }
 
     const visibleTools = tools.visible();
@@ -181,6 +197,14 @@ export async function runAgent(messages, deps, options = {}) {
     });
 
     for (const result of results) messages.push(result);
+
+    // Stepped synchronously, before the next model call: the reminder that
+    // reads these counters must never see a stale one.
+    if (deps.afterToolResults) {
+      for (const extra of deps.afterToolResults(results) ?? []) {
+        if (extra) messages.push(extra);
+      }
+    }
 
     if (signal?.aborted) {
       stopped = "aborted";

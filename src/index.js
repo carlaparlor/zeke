@@ -41,6 +41,7 @@ export {
 export { SessionStore } from "./session/store.js";
 export { compact, shouldCompact, extractiveSummary } from "./session/compact.js";
 export { renderTranscript, exportTranscript } from "./session/export.js";
+export { TodoReminders, isAwaitingUserAnswer, TODO_EAGER_MODES } from "./session/todo-reminders.js";
 
 export { EventBus, Events } from "./lib/events.js";
 export { parseJsonc, stripJsonc } from "./lib/jsonc.js";

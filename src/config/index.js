@@ -70,6 +70,15 @@ export const DEFAULTS = Object.freeze({
     autoApproveBash: false,
   },
   tools: { only: [], exclude: [] },
+  // Session-level todo nudging. Keys mirror omp's (`todo.eager` accepts the
+  // same three modes) so the two agents stay comparable; zeke only differs on
+  // the *default* for `eager`, which is `preferred` instead of `default` (off).
+  todo: {
+    enabled: true,
+    reminders: true,
+    remindersMax: 3,
+    eager: "preferred", // "default" (off) | "preferred" (suggest) | "always" (insist)
+  },
   compaction: { enabled: true, targetRatio: 0.6, keepTail: 6 },
   session: { persist: true },
   ui: { color: true, streaming: true, diff: true, thinking: false, spinner: true, spinnerStyle: "dots" },
@@ -90,6 +99,7 @@ export const DEFAULTS = Object.freeze({
  * @property {typeof DEFAULTS.bridge} bridge
  * @property {typeof DEFAULTS.approval} approval
  * @property {typeof DEFAULTS.tools} tools
+ * @property {typeof DEFAULTS.todo} todo
  * @property {typeof DEFAULTS.compaction} compaction
  * @property {typeof DEFAULTS.session} session
  * @property {typeof DEFAULTS.ui} ui
@@ -175,6 +185,7 @@ export async function loadConfig(options = {}) {
     bridge: bridgeResolved,
     approval: { ...DEFAULTS.approval, ...(merged.approval ?? {}) },
     tools: { ...DEFAULTS.tools, ...(merged.tools ?? {}) },
+    todo: { ...DEFAULTS.todo, ...(merged.todo ?? {}) },
     compaction: { ...DEFAULTS.compaction, ...(merged.compaction ?? {}) },
     session: { ...DEFAULTS.session, ...(merged.session ?? {}) },
     ui: { ...DEFAULTS.ui, ...(merged.ui ?? {}) },

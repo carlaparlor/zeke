@@ -186,6 +186,22 @@ describe("message conversion", () => {
     assert.equal(repaired[0].content, "one\n\ntwo");
   });
 
+  test("repairHistory keeps injected reminders out of the user turn", () => {
+    const reminder = { role: "user", content: "<system-reminder>3 todo items still open</system-reminder>", synthetic: true };
+    const repaired = repairHistory([
+      { role: "user", content: "one" },
+      { role: "user", content: "two" },
+      reminder,
+      { role: "user", content: "carry on" },
+    ]);
+    // Ordinary back-to-back user turns still collapse; a reminder never merges
+    // with either neighbour.
+    assert.equal(repaired.length, 3);
+    assert.equal(repaired[0].content, "one\n\ntwo");
+    assert.equal(repaired[1].content, reminder.content);
+    assert.equal(repaired[2].content, "carry on");
+  });
+
   test("repairHistory leaves a well-formed transcript alone", () => {
     const messages = [
       { role: "user", content: "go" },

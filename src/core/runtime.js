@@ -11,6 +11,7 @@ import { createProvider } from "../providers/index.js";
 import { buildSystemPrompt, loadProjectContext, loadProjectPrompt } from "../prompts/system.js";
 import { runAgent } from "./agent.js";
 import { SessionStore } from "../session/store.js";
+import { TodoReminders } from "../session/todo-reminders.js";
 import { compact, shouldCompact } from "../session/compact.js";
 import { evaluateApproval } from "./approval.js";
 import { estimateMessagesTokens } from "./types.js";
@@ -58,6 +59,8 @@ export class ZekeRuntime {
   #session;
   #tools;
   #provider;
+  /** @type {TodoReminders|null} session-level todo nudges */
+  #reminders = null;
   #projectPrompt;
   #projectContext;
   /** Index into `messages` of the first entry not yet written to disk. */
@@ -70,6 +73,16 @@ export class ZekeRuntime {
       exclude: this.config.tools.exclude,
     });
     for (const tool of this.#extraTools) this.#tools.register(tool);
+
+    // Nudging reads the todo list the tool keeps per session, so it is built
+    // once the registry exists and asked for the session id lazily — `resume`
+    // and `startNewSession` both swap it underneath.
+    this.#reminders = new TodoReminders({
+      config: this.config,
+      sessionId: () => this.#session?.id,
+      hasTool: (name) => Boolean(this.#tools.has(name)),
+      isMutating: (name) => Boolean(this.#tools.get(name)?.mutating),
+    });
 
     this.#provider = createProvider({
       type: this.config.provider,
@@ -114,6 +127,11 @@ export class ZekeRuntime {
 
   get systemPrompt() {
     return this.messages[0]?.content ?? "";
+  }
+
+  /** The session's todo nudges (eager/mid-run/error/completion reminders). */
+  get reminders() {
+    return this.#reminders;
   }
 
   #seedSystemPrompt() {
@@ -189,12 +207,25 @@ export class ZekeRuntime {
   }
 
   /**
-   * Run one user turn to completion.
+   * Run one user turn to completion — including any stop-time todo
+   * continuations it earns.
    * @param {string} input
-   * @param {{signal?: AbortSignal, model?: string, thinking?: boolean}} [options]
+   * @param {{signal?: AbortSignal, model?: string, thinking?: boolean, maxTurns?: number}} [options]
    */
   async run(input, options = {}) {
-    this.messages.push({ role: "user", content: input, ts: Date.now() });
+    const text = String(input);
+    this.#reminders?.resetCycle();
+
+    // Eager prelude: first turn of a session, list still empty. It goes in
+    // ahead of the request (omp prepends its preludes the same way) and is
+    // never persisted — a resumed session does not need it a second time.
+    const prelude = this.#reminders?.eagerPrelude(text, { isFirstTurn: this.#isFirstTurn() });
+    if (prelude) {
+      this.messages.push(prelude);
+      this.#emitReminder(prelude);
+    }
+
+    this.messages.push({ role: "user", content: text, ts: Date.now() });
     // Record the request immediately so a crash mid-turn still shows what was
     // asked, and move the cursor past it so the flush below does not repeat it.
     if (this.#session) {
@@ -202,41 +233,138 @@ export class ZekeRuntime {
       this.#persisted = this.messages.length;
     }
 
-    const result = await runAgent(this.messages, {
-      provider: this.#provider,
-      tools: this.#tools,
-      events: this.events,
-      approve: (call, tool) => this.#approveCall(call, tool),
-      cwd: this.cwd,
-      ask: this.#ask.bind(this),
-      sessionId: this.#session?.id,
-      state: this.state ?? (this.state = {}),
-      maxTurns: options.maxTurns ?? this.config.maxTurns,
-    }, {
-      signal: options.signal,
-      model: options.model ?? this.config.model,
-      maxTokens: this.config.maxTokens,
-      thinking: options.thinking ?? this.config.thinking,
-    });
+    let budget = options.maxTurns ?? this.config.maxTurns;
+    let turns = 0;
+    const usage = { inputTokens: 0, outputTokens: 0 };
+    const account = (run) => {
+      turns += run.turns;
+      budget -= run.turns;
+      usage.inputTokens += run.usage.inputTokens;
+      usage.outputTokens += run.usage.outputTokens;
+    };
 
-    this.turns += result.turns;
-    this.usage.inputTokens += result.usage.inputTokens;
-    this.usage.outputTokens += result.usage.outputTokens;
+    let result = await this.#runOnce(options, budget);
+    account(result);
+
+    // Stop-time todo reconciliation: the model stopped talking while items
+    // were still open. Hand it the remainder and let it carry on — bounded by
+    // `todo.remindersMax` and by whatever turn budget is left.
+    while (budget > 0 && !options.signal?.aborted) {
+      const reminder = this.#reminders?.checkCompletion(this.#stoppedTurn(result, options.signal));
+      if (!reminder) break;
+      this.messages.push(reminder);
+      this.#emitReminder(reminder);
+      result = await this.#runOnce(options, budget);
+      account(result);
+    }
+
+    this.turns += turns;
+    this.usage.inputTokens += usage.inputTokens;
+    this.usage.outputTokens += usage.outputTokens;
 
     // Persist everything the loop appended (index 0 is the system prompt,
-    // which lives in config, not in the transcript).
+    // which lives in config, not in the transcript). Synthetic reminders are
+    // skipped: they are derived from state, and "you stopped with 3 items
+    // open" is noise in a transcript you resume next week.
     if (this.#session) {
       for (const message of this.messages.slice(this.#persisted)) {
-        if (message.role !== "system") await this.#session.appendMessage(message);
+        if (message.role !== "system" && !message.synthetic) await this.#session.appendMessage(message);
       }
       this.#persisted = this.messages.length;
       if (!this.#session.meta.title) {
-        await this.#session.setTitle(deriveTitle(input));
+        await this.#session.setTitle(deriveTitle(text));
       }
     }
 
     await this.#maybeCompact();
-    return result;
+    return { ...result, turns, usage };
+  }
+
+  /**
+   * One agent pass over the shared message list.
+   * @param {{signal?: AbortSignal, model?: string, thinking?: boolean}} options
+   * @param {number} maxTurns remaining budget for this pass
+   */
+  #runOnce(options, maxTurns) {
+    return runAgent(
+      this.messages,
+      {
+        provider: this.#provider,
+        tools: this.#tools,
+        events: this.events,
+        approve: (call, tool) => this.#approveCall(call, tool),
+        cwd: this.cwd,
+        ask: this.#ask.bind(this),
+        sessionId: this.#session?.id,
+        state: this.state ?? (this.state = {}),
+        maxTurns,
+        // Session-level nudges: polled at every turn boundary, and after every
+        // batch of tool results.
+        asides: () => this.#asides(),
+        afterToolResults: (results) => this.#afterToolResults(results),
+      },
+      {
+        signal: options.signal,
+        model: options.model ?? this.config.model,
+        maxTokens: this.config.maxTokens,
+        thinking: options.thinking ?? this.config.thinking,
+      },
+    );
+  }
+
+  /**
+   * How the last agent pass ended, as the todo completion reminder sees it.
+   * @param {{stopped: string}} result
+   * @param {AbortSignal} [signal]
+   */
+  #stoppedTurn(result, signal) {
+    let assistant;
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      if (this.messages[i].role === "assistant") {
+        assistant = this.messages[i];
+        break;
+      }
+    }
+    return {
+      text: String(assistant?.content ?? ""),
+      hasToolCalls: Boolean(assistant?.toolCalls?.length),
+      stopped: result.stopped,
+      aborted: Boolean(signal?.aborted),
+    };
+  }
+
+  /** Nudges polled at each turn boundary, so they reflect the freshest state. */
+  #asides() {
+    const nudge = this.#reminders?.takeMidRunNudge();
+    if (!nudge) return [];
+    this.#emitReminder(nudge);
+    return [nudge];
+  }
+
+  /**
+   * Reminders that ride immediately behind a tool result — a `todo` call that
+   * failed, so the list the user is watching went stale.
+   * @param {any[]} results
+   */
+  #afterToolResults(results) {
+    const reminders = this.#reminders?.onToolResults(results) ?? [];
+    for (const message of reminders) this.#emitReminder(message);
+    return reminders;
+  }
+
+  /** @param {{reminder: string, incomplete?: number, attempt?: number, maxAttempts?: number}} message */
+  #emitReminder(message) {
+    this.events.emit(Events.TODO_REMINDER, {
+      kind: message.reminder,
+      incomplete: message.incomplete,
+      attempt: message.attempt,
+      maxAttempts: message.maxAttempts,
+    });
+  }
+
+  /** True until the user has said anything of their own (ignoring nudges). */
+  #isFirstTurn() {
+    return !this.messages.some((message) => message.role === "user" && !message.synthetic);
   }
 
   async #maybeCompact() {

@@ -189,6 +189,14 @@ export function createRenderer(events, options = {}) {
   );
 
   unsubscribes.push(
+    events.on(Events.TODO_REMINDER, (data) => {
+      ensureNotInText();
+      stopSpinner();
+      line(dim(`todo · ${describeReminder(data)}`));
+    }),
+  );
+
+  unsubscribes.push(
     events.on(Events.COMPACT, (data) => {
       ensureNotInText();
       stopSpinner();
@@ -226,6 +234,29 @@ export function createRenderer(events, options = {}) {
       for (const off of unsubscribes) off();
     },
   };
+}
+
+/**
+ * One dim line for a session-level todo nudge, so the transcript shows *why*
+ * the agent suddenly carried on, or why it was asked for a list up front.
+ *
+ * @param {{kind?: string, incomplete?: number, attempt?: number, maxAttempts?: number}} data
+ */
+function describeReminder(data) {
+  const count = data?.incomplete ?? 0;
+  const plural = count === 1 ? "" : "s";
+  switch (data?.kind) {
+    case "eager-todo":
+      return "asked for a phased todo first";
+    case "mid-run":
+      return `${count} item${plural} still open — asked for a todo update`;
+    case "todo-error":
+      return "todo call failed — asked for a corrected call";
+    case "completion":
+      return `${count} item${plural} still open · reminder ${data.attempt}/${data.maxAttempts}`;
+    default:
+      return "reminder";
+  }
 }
 
 /**

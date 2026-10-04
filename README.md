@@ -250,6 +250,42 @@ single user message:
 | `todo` | read-only, exclusive | `todo {"op", "list"?, "task"?, "phase"?, "items"?, "reason"?}` — phased task list, same contract as omp: `init`/`start`/`done`/`drop`/`block`/`unblock`/`append`/`rm`/`view`; tasks addressed by verbatim content; one task `in_progress` at a time; `/todo` shows it |
 | `ask` | writes | asks *you* a question mid-run |
 
+### Session-level todo reminders
+
+The `todo` tool owns the list; the session owns the nudging. Ported from oh-my-pi's agent-session
+layer (`session/todo-tracker.ts`), four reminders keep the list honest. Each is injected as a
+`<system-reminder>` the model sees — never written to the transcript, so a session you resume next
+week does not replay "you stopped with 3 items open" back at itself.
+
+| Nudge | Fires when | What the model is told |
+|---|---|---|
+| `eager-todo` | first turn of a session, list still empty | lay out a phased plan with one `init` before substantive work |
+| `mid-run` | 12 successful mutating tool calls since the list was last touched | "N todo items still open" — mark what you finished; at most twice a turn |
+| `todo-error` | a `todo` call failed | the failure, and to fix the payload and call again before continuing |
+| `completion` | the model stopped talking with items still open | what is left, and to continue or mark it done — at most `remindersMax` times |
+
+Guards worth knowing: nothing is injected when the model's last line is a question *for you* (it is
+waiting, not finished), when the previous nudge has not yet produced a single tool call, or when
+the run ended on an interrupt, an error, the turn cap, or still mid-tool-use. The eager prelude also
+skips prompts that end in `?` or `!` — a question is not a work list. The mid-run nudge counts only
+successful `bash`/`edit`/`write` calls (a plugin tool joins that set by declaring `mutating: true`):
+exploration is not progress you can tick off.
+
+```jsonc
+"todo": {
+  "enabled": true,       // false: zeke stops nudging (the tool stays; drop it with tools.exclude)
+  "reminders": true,     // false: no injected todo text at all
+  "remindersMax": 3,     // completion nudges per user turn
+  "eager": "preferred"   // default (off) | preferred (suggest) | always (insist)
+}
+```
+
+`eager: "always"` is the same prelude with imperative wording. omp pairs it with a forced
+`tool_choice: todo`; the GLM-Free-API agent shim offers no `tool_choice`, so zeke does what omp
+itself does on a model without one — send the reminder and let the model comply. zeke's default is
+`preferred` where omp's is `default` (off): the system prompt here already asks for a plan before
+substantive work, so the nudge reinforces it rather than introducing it.
+
 Approvals are policy, not a prompt you have to fight. `auto` (default) approves reads and
 writes and asks before `bash`; `--yolo` approves everything; `--ask` asks about everything.
 Read-only bash commands are recognised and let through; destructive ones are flagged.
@@ -322,7 +358,8 @@ defaults, then a project `.zeke/config.json`, then environment variables.
   "approval": { "mode": "auto" },// ask | auto | yolo
   "bridge":   { "port": 3001, "agentMode": true },
   "compaction": { "enabled": true, "targetRatio": 0.6 },
-  "tools":    { "exclude": ["bash"] }
+  "tools":    { "exclude": ["bash"] },
+  "todo":     { "eager": "preferred", "reminders": true, "remindersMax": 3 }
 }
 ```
 
@@ -398,7 +435,7 @@ lib/        primitives — jsonc, args, paths, events, json-repair
 core/       types, agent loop, approval policy, ZekeRuntime
 providers/  SSE decoding, OpenAI wire format, GLM specifics
 tools/      the eight built-ins + registry
-session/    JSONL store, compaction, export
+session/    JSONL store, compaction, export, session-level todo reminders
 ui/         ANSI + width-aware text, theme, streaming renderer, approval prompt, full-screen TUI
 cli/        argument routing, REPL, headless, setup, doctor
 plugins/    the plugin API surface
