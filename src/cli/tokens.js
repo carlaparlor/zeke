@@ -17,7 +17,7 @@ import { stat } from "node:fs/promises";
 import { paths } from "../lib/paths.js";
 import { saveSecrets, maskSecret } from "../config/index.js";
 import { buildBridge } from "../bridge/build.js";
-import { collectReadiness, harvestTokens } from "../bridge/collector.js";
+import { collectReadiness, harvestTokens, probeChatZai } from "../bridge/collector.js";
 import { bridgeConfigFrom, health as bridgeHealth, swapTokenDb } from "../bridge/bridge.js";
 import { acquireHarvestLock, describeKeeperState, keeperStatus, releaseHarvestLock } from "../bridge/keeper.js";
 import { style } from "../ui/ansi.js";
@@ -101,17 +101,34 @@ export async function tokensCommand({ flags, positional, config }) {
   if (action === "collect") {
     if (flags["dry-run"]) {
       const readiness = await collectReadiness();
+      // Everything above is local; the harvest also needs the network, and a
+      // failed lookup is the one prerequisite no amount of local setup fixes.
+      const network = await probeChatZai();
       out(paint.bold("harvesting prerequisites"));
       out(`  collector    ${readiness.collector.exists ? paint.green(readiness.collector.path) : paint.yellow(`not built (${readiness.collector.path})`)}`);
       out(`  source       ${readiness.source ? paint.green(paths.vendoredBridge()) : paint.red("missing")}`);
       out(`  go           ${readiness.go ? paint.green(`${readiness.go.go} (${readiness.go.origin})`) : paint.yellow("not found")}`);
       out(`  browsers     ${readiness.browsers.any ? paint.green(readiness.browsers.dirs.join(", ")) : paint.yellow("not cached — the collector downloads them on first run")}`);
+      out(
+        `  network      ${
+          network.skipped
+            ? paint.yellow(`${network.host} check skipped (ZEKE_SKIP_NETWORK_CHECK=1)`)
+            : network.ok
+              ? paint.green(`${network.host} resolves to ${network.address}`)
+              : paint.red(`${network.host} does not resolve (${network.code})`)
+        }`,
+      );
       for (const note of readiness.notes) out(paint.dim(`  note: ${note}`));
       for (const blocker of readiness.blockers) {
         out(paint.red(`  blocker: ${blocker.message}`));
         out(paint.dim(`    ↳ ${blocker.fix}`));
       }
-      return readiness.ready ? 0 : 1;
+      if (!network.ok) {
+        out(paint.red(`  blocker: ${network.message}`));
+        out(paint.dim(`    ↳ ${network.fix}`));
+        out(paint.dim("      (if the browser can still reach chat.z.ai, re-run with ZEKE_SKIP_NETWORK_CHECK=1)"));
+      }
+      return readiness.ready && network.ok ? 0 : 1;
     }
 
     const lock = await acquireHarvestLock();
@@ -164,11 +181,15 @@ async function collectTokens({ flags, bridgeConfig, paint, out }) {
   out("");
 
   // The collector writes ./tokens.sqlite in its cwd, so harvestTokens runs it
-  // from $ZEKE_HOME — the path the bridge was started with.
+  // from $ZEKE_HOME — the path the bridge was started with. The preflight is
+  // what keeps a DNS/proxy failure from reaching the browser as
+  // `net::ERR_NAME_NOT_RESOLVED` after a launch, an install check and three
+  // retries: there is nothing to retry when the host does not resolve.
   const result = await harvestTokens({
     flags,
     config: bridgeConfig,
     log: (line) => out(paint.dim(`  ${line}`)),
+    preflight: () => probeChatZai(),
   });
 
   out("");
@@ -178,10 +199,16 @@ async function collectTokens({ flags, bridgeConfig, paint, out }) {
       out(`  ${blocker.message}`);
       out(paint.dim(`  ↳ ${blocker.fix}`));
     }
+    // The preflight is a strong hint, not a wall: say how to overrule it.
+    if (result.preflight) out(paint.dim("  (to launch the browser anyway: ZEKE_SKIP_NETWORK_CHECK=1 zeke tokens collect)"));
     return 1;
   }
   if (result.code !== 0) {
     out(`${paint.red("✗")} collector exited with ${result.code}`);
+    if (result.diagnosis) {
+      out(`  ${result.diagnosis.message}`);
+      out(paint.dim(`  ↳ ${result.diagnosis.fix}`));
+    }
     out(paint.dim("  if it failed launching a browser, install the system libraries: `npx playwright install-deps chromium`"));
     out(paint.dim("  and re-run with --no-tui if the TUI swallowed the error"));
     return result.code;

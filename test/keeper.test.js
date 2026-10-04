@@ -19,6 +19,7 @@ import {
   ensureAlive,
   harvestFlags,
   harvestLockHeld,
+  harvestVerdict,
   keeperStatus,
   planCycle,
   releaseHarvestLock,
@@ -332,6 +333,48 @@ describe("harvest flags", () => {
       "no-tui": true,
     });
     assert.deepEqual(harvestFlags({}), { tokens: undefined, batch: undefined, parallel: undefined, "no-tui": true });
+  });
+});
+
+describe("harvest verdicts", () => {
+  // The keeper is unattended: whatever it logs has to be the reason, not an
+  // exit code. A harvest that never started reports its blocker, and a run
+  // that failed reports the network cause the collector printed.
+  const dnsOutput = "❌ Attempt 1 failed: goto: playwright: net::ERR_NAME_NOT_RESOLVED\n";
+
+  test("a harvest that could not start reports why", () => {
+    const verdict = harvestVerdict({
+      ran: false,
+      code: 1,
+      harvested: false,
+      swapped: false,
+      tokenCount: -1,
+      readiness: { blockers: [{ message: "chat.z.ai does not resolve on this machine (ENOTFOUND)", fix: "check DNS" }] },
+    });
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.error, /does not resolve/);
+  });
+
+  test("a failed run is explained from the collector's own output", () => {
+    const verdict = harvestVerdict({ ran: true, code: 1, harvested: false, swapped: false, tokenCount: -1 }, dnsOutput);
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.error, /DNS failure/);
+    assert.match(verdict.error, /nslookup|resolv\.conf|VPN/);
+  });
+
+  test("a failure with no nameable cause stays a plain exit code", () => {
+    const verdict = harvestVerdict({ ran: true, code: 3, harvested: false, swapped: false, tokenCount: -1 }, "boom\n");
+    assert.equal(verdict.ok, false);
+    assert.equal(verdict.error, "the collector exited with 3");
+  });
+
+  test("an unconfirmed swap is still a successful harvest", () => {
+    const verdict = harvestVerdict({ ran: true, code: 0, harvested: true, swapped: false, tokenCount: 12 });
+    assert.deepEqual(verdict, { ok: true, tokenCount: -1 });
+    assert.deepEqual(harvestVerdict({ ran: true, code: 0, harvested: true, swapped: true, tokenCount: 12 }), {
+      ok: true,
+      tokenCount: 12,
+    });
   });
 });
 

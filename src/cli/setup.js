@@ -12,7 +12,7 @@ import path from "node:path";
 import { paths } from "../lib/paths.js";
 import { maskSecret, saveSecrets } from "../config/index.js";
 import { buildBridge, ensureVendored, findGo, sourceFingerprint, writeBuildInfo, UPSTREAM_REPO } from "../bridge/build.js";
-import { collectReadiness, harvestTokens } from "../bridge/collector.js";
+import { collectReadiness, harvestTokens, probeChatZai } from "../bridge/collector.js";
 import { bridgeBaseUrl, health as bridgeHealth, startBridge, stopBridge, swapTokenDb } from "../bridge/bridge.js";
 import { createGlmProvider, GLM_MODEL_PRESETS } from "../providers/glm.js";
 import { style } from "../ui/ansi.js";
@@ -235,7 +235,12 @@ export async function setupCommand({ flags, config }) {
         for (const blocker of harvest.blockers) log(paint.dim(`    ${blocker.message} → ${blocker.fix}`));
       } else if (await askYesNo("  harvest device tokens now? [Y/n] ", true)) {
         log(paint.dim("  running the collector — it drives a real browser and installs Chromium on first run"));
-        const result = await harvestTokens({ flags, config: bridgeConfig, log: (line) => log(paint.dim(`    ${line}`)) });
+        const result = await harvestTokens({
+          flags,
+          config: bridgeConfig,
+          log: (line) => log(paint.dim(`    ${line}`)),
+          preflight: () => probeChatZai(),
+        });
         if (result.code === 0 && result.harvested && result.swapped && result.tokenCount > 0) {
           ok(`harvested and hot-swapped — ${result.tokenCount} device tokens`);
           summary.needsTokens = false;
@@ -251,8 +256,13 @@ export async function setupCommand({ flags, config }) {
             fail(retry.detail);
           }
         } else {
-          fail(`harvesting did not produce a usable pool${result.swapError ? ` (${result.swapError})` : ""}`);
-          log(paint.dim("  if the browser failed to launch: `npx playwright install-deps chromium`"));
+          const blocker = !result.ran ? result.readiness?.blockers?.[0] : null;
+          fail(`harvesting did not produce a usable pool${result.swapError ? ` (${result.swapError})` : ""}${blocker ? ` — ${blocker.message}` : ""}`);
+          if (blocker) log(paint.dim(`  ↳ ${blocker.fix}`));
+          else if (result.diagnosis) {
+            log(`  ${result.diagnosis.message}`);
+            log(paint.dim(`  ↳ ${result.diagnosis.fix}`));
+          } else log(paint.dim("  if the browser failed to launch: `npx playwright install-deps chromium`"));
         }
       }
     }
