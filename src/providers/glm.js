@@ -5,7 +5,7 @@
 // exists in agent mode, whose models come from Z.AI, and whose guest session
 // only serves `glm-5.3-flash` and `glm-4.7`.
 
-import { createOpenAiProvider } from "./openai.js";
+import { createOpenAiProvider, describeNetworkFailure } from "./openai.js";
 
 export const DEFAULT_GLM_MODEL = "glm-4.7";
 
@@ -111,7 +111,7 @@ export function createGlmProvider(config = {}) {
             : `healthy${tokenNote} but completion failed — ${completion.detail}${diagnoseCompletionFailure(completion.detail, tokens)}`,
         };
       } catch (err) {
-        return { ok: false, detail: `bridge not reachable at ${root}: ${err.message}` };
+        return { ok: false, detail: describeNetworkFailure(err, root) };
       }
     },
 

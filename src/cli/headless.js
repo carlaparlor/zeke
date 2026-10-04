@@ -6,6 +6,7 @@
 import { ZekeRuntime } from "../core/runtime.js";
 import { createRenderer } from "../ui/render.js";
 import { createApprovalPrompt } from "../ui/approve.js";
+import { Events } from "../lib/events.js";
 
 /**
  * @param {string} input
@@ -49,6 +50,13 @@ export async function runHeadless(input, { config, flags, cwd }) {
     });
   }
 
+  // The renderer reports a model failure the moment it arrives; the answer
+  // line below must not print the very same message a second time.
+  let lastModelError = "";
+  runtime.events.on(Events.MODEL_ERROR, (data) => {
+    lastModelError = String(data?.error?.message ?? "");
+  });
+
   let result;
   let failure = null;
   try {
@@ -85,12 +93,14 @@ export async function runHeadless(input, { config, flags, cwd }) {
     stream.write(`${JSON.stringify(payload, null, 2)}\n`);
   } else if (format === "stream-json") {
     stream.write(`${JSON.stringify({ type: "result", ...payload })}\n`);
+  } else if (flags.quiet || flags["no-stream"]) {
+    // In quiet/--no-stream mode the renderer did not stream the answer, so
+    // print it here — but a failure it already reported verbatim would
+    // otherwise appear twice.
+    const repeated = !flags.quiet && Boolean(result.finalText) && result.finalText === lastModelError;
+    if (!repeated) stream.write(`${result.finalText}\n`);
   } else {
-    // The renderer already streamed the text; in quiet/--no-stream mode it
-    // did not, so print the final answer here exactly once.
-    if (flags.quiet || flags["no-stream"]) stream.write(`${result.finalText}\n`);
-    else if (!result.finalText) stream.write("\n");
-    else stream.write("\n");
+    stream.write("\n");
   }
 
   await runtime.close();

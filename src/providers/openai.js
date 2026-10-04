@@ -41,6 +41,89 @@ export function classifyStatus(status) {
 }
 
 /**
+ * `cause.code`s from undici/node sockets that a retry cannot fix: nothing is
+ * listening on the port, the host does not resolve, the network is unreachable.
+ * Retrying those spends seconds to produce the identical failure, and buries
+ * the one message that says what to do. Everything else (resets, timeouts, a
+ * socket dying mid-stream) is worth another attempt.
+ */
+const FATAL_NETWORK_CODES = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "EADDRNOTAVAIL",
+  "ERR_INVALID_URL",
+]);
+
+/**
+ * URL-parse failures arrive from undici without an errno code, and a typo in
+ * `ZEKE_BASE_URL` is not going to fix itself on a retry either.
+ */
+const FATAL_NETWORK_MESSAGES = [/bad port/i, /invalid url/i, /failed to parse url/i, /url scheme must be/i];
+
+/** The errno-style code for a failed fetch, wherever undici hid it. */
+export function networkErrorCode(err) {
+  return err?.cause?.code ?? err?.cause?.cause?.code ?? err?.code ?? undefined;
+}
+
+function networkErrorText(err) {
+  return String(err?.cause?.message ?? err?.message ?? "");
+}
+
+/** False only for failures that are certain to fail again, unchanged. */
+export function isRetryableNetworkFailure(err) {
+  const code = networkErrorCode(err);
+  if (code !== undefined && FATAL_NETWORK_CODES.has(code)) return false;
+  const text = networkErrorText(err);
+  return !FATAL_NETWORK_MESSAGES.some((pattern) => pattern.test(text));
+}
+
+/**
+ * The readable half of a failed fetch.
+ *
+ * `fetch failed` is undici's wrapper text: the informative part is the `code`
+ * on its cause, and dropping it is how "cannot reach …: fetch failed" ends up
+ * telling someone with a stopped bridge nothing at all.
+ */
+export function networkFailureReason(err) {
+  const code = networkErrorCode(err);
+  const text = networkErrorText(err);
+  if (/bad port/i.test(text)) return "the base URL names an unusable port";
+  if (/failed to parse url|invalid url|url scheme must be/i.test(text)) return "the base URL is not a valid URL";
+  return (() => {
+    switch (code) {
+      case "ECONNREFUSED":
+        return "connection refused — nothing is listening there";
+      case "ENOTFOUND":
+      case "EAI_AGAIN":
+        return "the host name does not resolve";
+      case "ENETUNREACH":
+      case "EHOSTUNREACH":
+        return "the network is unreachable";
+      case "EADDRNOTAVAIL":
+        return "that address is not available on this machine";
+      case "ECONNRESET":
+        return "the connection was reset";
+      case "ETIMEDOUT":
+      case "UND_ERR_CONNECT_TIMEOUT":
+        return "the connection timed out";
+      case "UND_ERR_SOCKET":
+        return "the socket closed mid-response";
+      default:
+        return err?.cause?.message ?? err?.message ?? "the request failed";
+    }
+  })();
+}
+
+/** The same thing, addressed to the endpoint that failed. */
+export function describeNetworkFailure(err, baseUrl) {
+  const remedy = networkErrorCode(err) === "ECONNREFUSED" ? " (is the bridge running? `zeke bridge start`)" : "";
+  return `cannot reach ${baseUrl}: ${networkFailureReason(err)}${remedy}`;
+}
+
+/**
  * @typedef {object} OpenAiProviderConfig
  * @property {string} baseUrl        e.g. http://127.0.0.1:3001/v1
  * @property {string} apiKey         bridge AUTH_TOKEN
@@ -172,7 +255,11 @@ export function createOpenAiProvider(config) {
       });
     } catch (err) {
       if (controller.signal.aborted) throw abortError();
-      throw new ProviderError(`cannot reach ${config.baseUrl}: ${err.message}`, { kind: "network", cause: err });
+      throw new ProviderError(describeNetworkFailure(err, config.baseUrl), {
+        kind: "network",
+        retryable: isRetryableNetworkFailure(err),
+        cause: err,
+      });
     }
 
     if (!response.ok) throw fromResponse(response, await safeText(response), config.baseUrl);
@@ -302,7 +389,7 @@ export function createOpenAiProvider(config) {
       const err = fromResponse(response, await safeText(response), config.baseUrl);
       return { ok: false, detail: `${err.kind}: ${err.message}` };
     } catch (err) {
-      return { ok: false, detail: `unreachable: ${err.message}` };
+      return { ok: false, detail: describeNetworkFailure(err, config.baseUrl) };
     }
   }
 

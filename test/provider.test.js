@@ -2,7 +2,15 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { SseDecoder, OpenAiChunkAccumulator, inlineErrorOf, isDoneMarker } from "../src/providers/sse.js";
 import { toOpenAiMessages, toOpenAiTools, repairHistory, finalizeToolCall, stripSchema } from "../src/providers/messages.js";
-import { createOpenAiProvider, ProviderError, classifyStatus } from "../src/providers/openai.js";
+import {
+  createOpenAiProvider,
+  ProviderError,
+  classifyStatus,
+  describeNetworkFailure,
+  isRetryableNetworkFailure,
+  networkErrorCode,
+  networkFailureReason,
+} from "../src/providers/openai.js";
 import { createGlmProvider, isGuestModel, GLM_MODEL_PRESETS } from "../src/providers/glm.js";
 import { startMockBridge, scripted } from "../src/mock-bridge/server.js";
 
@@ -481,6 +489,83 @@ describe("provider against the mock bridge", () => {
     }
   });
 
+  test("a refused connection is not retried, and says what to do", async () => {
+    let attempts = 0;
+    const provider = createOpenAiProvider({
+      baseUrl: "http://127.0.0.1:3001/v1",
+      apiKey: "Waguri",
+      model: "glm-4.7",
+      retries: 2,
+      retryBaseMs: 1,
+      fetchImpl: async () => {
+        attempts++;
+        throw Object.assign(new TypeError("fetch failed"), {
+          cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:3001"), { code: "ECONNREFUSED" }),
+        });
+      },
+    });
+
+    const errors = [];
+    for await (const event of provider.stream({ messages: [{ role: "user", content: "hi" }] })) {
+      if (event.type === "error") errors.push(event.error);
+    }
+
+    assert.equal(attempts, 1, "a refused connection cannot succeed on a retry");
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].retryable, false);
+    assert.match(errors[0].message, /cannot reach http:\/\/127\.0\.0\.1:3001\/v1/);
+    assert.match(errors[0].message, /connection refused/);
+    assert.match(errors[0].message, /zeke bridge start/);
+  });
+
+  test("a transient socket failure is still retried", async () => {
+    let attempts = 0;
+    const provider = createOpenAiProvider({
+      baseUrl: "http://127.0.0.1:3001/v1",
+      apiKey: "Waguri",
+      model: "glm-4.7",
+      retries: 1,
+      retryBaseMs: 1,
+      fetchImpl: async () => {
+        attempts++;
+        throw Object.assign(new TypeError("fetch failed"), {
+          cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }),
+        });
+      },
+    });
+
+    for await (const _event of provider.stream({ messages: [{ role: "user", content: "hi" }] })) {
+      // drain
+    }
+    assert.equal(attempts, 2, "a reset is worth one more attempt");
+  });
+
+  test("a base URL typo is reported as such and not retried", async () => {
+    const badPort = Object.assign(new TypeError("fetch failed"), { cause: new Error("bad port") });
+    assert.equal(isRetryableNetworkFailure(badPort), false);
+    assert.match(networkFailureReason(badPort), /unusable port/);
+
+    const malformed = new TypeError("Failed to parse URL from not-a-url");
+    assert.equal(isRetryableNetworkFailure(malformed), false);
+    assert.match(describeNetworkFailure(malformed, "not-a-url"), /not a valid URL/);
+  });
+
+  test("network error classification covers the errno zoo", () => {
+    const withCode = (code) =>
+      Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error(code), { code }) });
+    assert.equal(networkErrorCode(withCode("ECONNREFUSED")), "ECONNREFUSED");
+    assert.equal(networkErrorCode(new TypeError("fetch failed")), undefined);
+
+    for (const code of ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH"]) {
+      assert.equal(isRetryableNetworkFailure(withCode(code)), false, `${code} should not be retried`);
+    }
+    for (const code of ["ECONNRESET", "ETIMEDOUT", "UND_ERR_SOCKET"]) {
+      assert.equal(isRetryableNetworkFailure(withCode(code)), true, `${code} is transient`);
+    }
+    assert.match(networkFailureReason(withCode("ENOTFOUND")), /does not resolve/);
+    assert.match(networkFailureReason(withCode("ETIMEDOUT")), /timed out/);
+  });
+
   test("listModels reads the OpenAI-shaped catalog", async () => {
     const bridge = await startMockBridge();
     try {
@@ -535,7 +620,7 @@ describe("provider against the mock bridge", () => {
     const provider = createGlmProvider({ baseUrl: "http://127.0.0.1:1/v1", apiKey: "x", model: "glm-4.7" });
     const result = await provider.probe();
     assert.equal(result.ok, false);
-    assert.match(result.detail, /not reachable/);
+    assert.match(result.detail, /cannot reach/);
   });
 
   test("a length finish reason is surfaced as such", async () => {
