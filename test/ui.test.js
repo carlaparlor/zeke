@@ -10,8 +10,24 @@ import assert from "node:assert/strict";
 import { Writable } from "node:stream";
 import { createRenderer } from "../src/ui/render.js";
 import { EventBus, Events } from "../src/lib/events.js";
-import { stripAnsi, visibleWidth, wrapText, truncateToWidth, colorEnabled, setColors, colorsAreEnabled, SYMBOLS } from "../src/ui/ansi.js";
-import { createApprovalPrompt, describeCall, previewDiff } from "../src/ui/approve.js";
+import {
+  stripAnsi,
+  visibleWidth,
+  wrapText,
+  wrapAnsi,
+  truncateAnsi,
+  fitToWidth,
+  truncateToWidth,
+  colorDepth,
+  colorEnabled,
+  setColors,
+  colorsAreEnabled,
+  SYMBOLS,
+  SPINNER_STYLES,
+} from "../src/ui/ansi.js";
+import { createTheme } from "../src/ui/theme.js";
+import { createStreamFormatter, styleLine, inline, summarizeToolCall } from "../src/ui/format.js";
+import { createApprovalPrompt, describeCall, previewDiff, rememberScope } from "../src/ui/approve.js";
 
 /** A stream that records everything written to it. */
 function capture() {
@@ -74,6 +90,57 @@ describe("ansi", () => {
     assert.equal(wrapped.replace(/\n/g, ""), "supercalifragilistic");
   });
 
+  test("wrapAnsi keeps every character, fits the width, and re-opens colour", () => {
+    const long = `\u001b[38;5;141mThis is a long coloured sentence\u001b[39m \u001b[1mwith bold\u001b[22m and \u001b[38;5;81mcyan words\u001b[39m that must wrap over several lines.`;
+    const wrapped = wrapAnsi(long, 28);
+    for (const line of wrapped.split("\n")) {
+      assert.ok(visibleWidth(line) <= 28, `overwide line: ${JSON.stringify(stripAnsi(line))}`);
+    }
+    const flatten = (text) => stripAnsi(text).replace(/\s+/g, " ").trim();
+    assert.equal(flatten(wrapped), flatten(long), "no text is lost or duplicated");
+    const coloured = wrapped.split("\n").filter((line) => line.includes("\u001b[38;5;"));
+    assert.ok(coloured.length >= 2, "colour survives past the first line break");
+  });
+
+  test("a word longer than the width is hard-broken rather than lost", () => {
+    const wrapped = wrapAnsi("x".repeat(25), 10);
+    assert.equal(stripAnsi(wrapped).replace(/\n/g, ""), "x".repeat(25));
+    for (const line of wrapped.split("\n")) assert.ok(visibleWidth(line) <= 10);
+  });
+
+  test("truncateAnsi and fitToWidth keep colour and hit the exact width", () => {
+    const painted = "\u001b[38;5;213mabcdefghij\u001b[39m";
+    assert.equal(visibleWidth(truncateAnsi(painted, 5)), 5);
+    assert.match(truncateAnsi(painted, 5), /\u001b\[38;5;213m/, "the colour is kept when cutting");
+    assert.equal(visibleWidth(fitToWidth(painted, 20)), 20, "padded to the full cell count");
+    assert.equal(visibleWidth(fitToWidth(painted, 4)), 4, "clipped to the cell count");
+    assert.equal(fitToWidth("", 3), "   ");
+  });
+
+  test("colour depth is negotiated from the environment", () => {
+    assert.equal(colorDepth({ TERM: "xterm-256color" }), 256);
+    assert.equal(colorDepth({ COLORTERM: "truecolor", TERM: "xterm-256color" }), 0x1000000);
+    assert.equal(colorDepth({ TERM: "xterm" }), 16);
+    assert.equal(colorDepth({ TERM: "dumb" }), 0);
+    assert.equal(colorDepth({ NO_COLOR: "1", TERM: "xterm-256color" }), 0);
+    assert.equal(colorDepth({ ZEKE_COLOR_DEPTH: "256", TERM: "dumb" }), 256, "the explicit override wins");
+  });
+
+  test("every spinner style has frames to animate", () => {
+    for (const [name, frames] of Object.entries(SPINNER_STYLES)) {
+      assert.ok(Array.isArray(frames) && frames.length > 1, name);
+      for (const frame of frames) assert.equal(visibleWidth(frame), 1, `${name} frame ${frame} must be one cell`);
+    }
+  });
+
+  test("a colourless theme emits no escape sequences at all", () => {
+    const theme = createTheme({ color: false });
+    assert.equal(theme.use, false);
+    assert.equal(theme.accent("x").includes("\u001b"), false);
+    assert.equal(theme.bold("x").includes("\u001b"), false);
+    assert.equal(theme.diffLine("+added"), "+added");
+  });
+
   test("colour can be forced off, and reports its state", () => {
     const before = colorsAreEnabled();
     setColors(false);
@@ -95,6 +162,52 @@ describe("ansi", () => {
       assert.equal(typeof value, "string", key);
       assert.ok(value.length > 0, key);
     }
+  });
+});
+
+describe("stream formatter", () => {
+  const theme = createTheme({ color: true, depth: 256 });
+  const plain = createTheme({ color: false });
+
+  test("styles headings, lists and inline code as lines complete", () => {
+    const formatter = createStreamFormatter(theme);
+    assert.deepEqual(formatter.push("## Title"), [], "a partial line is not finished yet");
+    assert.match(formatter.pending(), /Title/);
+    const [heading] = formatter.push("\n");
+    assert.match(heading, /\u001b\[38;5;141m/, "headings are accented");
+    const flat = stripAnsi(heading);
+    assert.match(flat, /## Title/, "the markdown marks stay visible, faint");
+  });
+
+  test("code fences colour their contents instead of rewriting them", () => {
+    const formatter = createStreamFormatter(plain);
+    formatter.push("```js\n");
+    const [line] = formatter.push("const x = -1;\n");
+    assert.equal(stripAnsi(line), "const x = -1;", "no bullets inside a fence");
+    const [after] = formatter.push("```\n");
+    assert.equal(stripAnsi(after), "```");
+  });
+
+  test("inline markdown is painted, and code spans are protected", () => {
+    const styled = inline(theme, "a **bold** and `code with **stars**` end");
+    assert.match(styled, /\u001b\[1m/, "bold is emitted");
+    assert.equal(stripAnsi(styled), "a bold and code with **stars** end");
+    assert.match(styled, /\u001b\[38;5;152mcode with \*\*stars\*\*/, "the code span keeps its literal text");
+  });
+
+  test("a line that is already coloured is never repainted", () => {
+    const line = "\u001b[32m✓\u001b[39m read a.md";
+    assert.equal(styleLine(theme, line), line);
+  });
+
+  test("tool summaries stay one line and are never dumped whole", () => {
+    const { name, detail, extra } = summarizeToolCall(
+      { name: "bash", arguments: { command: `echo ${"x".repeat(300)}` } },
+      { content: "ok", details: { exitCode: 0 } },
+    );
+    assert.equal(name, "bash");
+    assert.ok(detail.length <= 100, "the command is truncated for display");
+    assert.equal(extra, "exit 0");
   });
 });
 
@@ -421,5 +534,106 @@ describe("approval prompt", () => {
     await approve(call("edit", { path: "a.js", operations: [{ op: "replace", oldText: "before\n", newText: "after\n" }] }));
     assert.match(sink.text, /before/);
     assert.match(sink.text, /after/);
+  });
+
+  test("an unrecognised answer asks again instead of guessing", async () => {
+    const answers = ["maybe", "why", "y"];
+    const sink = out();
+    const approve = createApprovalPrompt({ stream: sink, color: false, ask: async () => answers.shift() });
+    const decision = await approve(call("bash", { command: "ls" }));
+    assert.equal(decision.approved, true);
+    assert.match(sink.text, /answer y, n, a or e/, "the prompt says what it accepts");
+  });
+
+  test("three invalid answers refuse rather than looping forever", async () => {
+    const sink = out();
+    const approve = createApprovalPrompt({ stream: sink, color: false, ask: async () => "huh" });
+    const decision = await approve(call("bash", { command: "ls" }));
+    assert.equal(decision.approved, false);
+    assert.match(decision.reason, /no valid answer/);
+  });
+
+  test("\"always\" on a shell command remembers the command, never the tool", async () => {
+    const approve = createApprovalPrompt({ stream: out(), color: false, ask: async () => "a" });
+    const decision = await approve(call("bash", { command: "npm test -- --watch" }));
+    assert.equal(decision.approved, true);
+    assert.equal(decision.remember, true);
+    assert.equal(decision.scope, "npm test", "the grant is scoped to the command shape");
+    assert.match(decision.reason, /npm test/);
+  });
+
+  test("\"always\" on a non-shell tool has no command scope", async () => {
+    const approve = createApprovalPrompt({ stream: out(), color: false, ask: async () => "a" });
+    const decision = await approve(call("write", { path: "/etc/passwd", content: "x" }));
+    assert.equal(decision.approved, true);
+    assert.equal(decision.remember, true);
+    assert.ok(!decision.scope, "whole-tool grants carry no command scope");
+  });
+
+  test("a compound command is never offered as a scope to remember", () => {
+    assert.equal(rememberScope(call("bash", { command: "npm test && rm -rf build" })), "");
+    assert.equal(rememberScope(call("bash", { command: "cat a | grep b" })), "");
+    assert.equal(rememberScope(call("bash", { command: "npm run build" })), "npm run");
+    assert.equal(rememberScope(call("edit", {})), "");
+  });
+
+  test("the modal resolves on one keypress and dismissals refuse", async () => {
+    const asked = [];
+    const choose = async (spec) => {
+      asked.push(spec);
+      return { key: "y", value: "y", label: "yes" };
+    };
+    const sink = out();
+    const approve = createApprovalPrompt({ stream: sink, color: false, choose });
+    const decision = await approve(call("bash", { command: "npm test" }), undefined, { reason: "shell command" });
+    assert.equal(decision.approved, true);
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].title, "Allow bash?");
+    assert.match(asked[0].lines.join("\n"), /npm test/);
+    assert.match(asked[0].lines.join("\n"), /why: shell command/);
+    const keys = asked[0].options.map((option) => option.key);
+    assert.deepEqual(keys, ["y", "n", "a", "e"], "yes, no, always and explain are the four answers");
+    assert.equal(asked[0].options.find((option) => option.key === "a").hint, "npm test");
+
+    const dismissed = createApprovalPrompt({ stream: out(), color: false, choose: async () => null });
+    const refused = await dismissed(call("bash", { command: "npm test" }));
+    assert.equal(refused.approved, false);
+  });
+
+  test("explain in the modal shows the arguments and asks again", async () => {
+    const seen = [];
+    const replies = [
+      { key: "e", value: "e", label: "explain" },
+      { key: "n", value: "n", label: "no" },
+    ];
+    const sink = out();
+    const approve = createApprovalPrompt({
+      stream: sink,
+      color: false,
+      choose: async (spec) => {
+        seen.push(spec);
+        return replies.shift();
+      },
+    });
+    const decision = await approve(call("bash", { command: "ls -la" }));
+    assert.equal(decision.approved, false);
+    assert.equal(seen.length, 2, "the prompt comes back after an explanation");
+    assert.match(sink.text, /"command"/, "the explain branch dumps the arguments");
+    assert.match(sink.text, /always/, "and says what always would remember");
+  });
+
+  test("a destructive command is called out in the prompt", async () => {
+    let spec = null;
+    const approve = createApprovalPrompt({
+      stream: out(),
+      color: false,
+      choose: async (given) => {
+        spec = given;
+        return { key: "n", value: "n" };
+      },
+    });
+    await approve(call("bash", { command: "rm -rf /" }), undefined, { danger: true, reason: "command looks destructive" });
+    assert.match(spec.title, /destructive/);
+    assert.match(spec.lines.join("\n"), /looks destructive/);
   });
 });

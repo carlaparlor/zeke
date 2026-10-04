@@ -8,10 +8,13 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { PassThrough } from "node:stream";
+import { createInterface } from "node:readline";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { sandbox } from "./helpers.js";
+import { askOnInterface } from "../src/cli/repl.js";
 
 const BIN = path.resolve("bin/zeke.mjs");
 
@@ -97,6 +100,45 @@ async function stopBridgeFromPidFile(home) {
     // no bridge was started, or it is already gone
   }
 }
+
+describe("one reader on stdin", () => {
+  test("answers a question on the existing readline instead of a second one", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const rl = createInterface({ input, output, terminal: false });
+
+    const first = askOnInterface(rl, "> ");
+    input.write("e\n");
+    assert.equal(await first, "e", "the typed answer resolves the pending question");
+
+    const second = askOnInterface(rl, "> ");
+    input.write("  A  \n");
+    assert.equal(await second, "  A  ", "the raw line is handed to the caller");
+
+    // After the question the interface is paused again (the REPL is inside a
+    // turn), so stray typing is not interpreted as an answer; it becomes an
+    // ordinary line once the REPL asks for input again.
+    const lines = [];
+    rl.on("line", (line) => lines.push(line));
+    input.write("stray typing\n");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(lines, [], "nothing is delivered while the turn holds the interface");
+    rl.resume();
+    input.write("hello\n");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(lines, ["stray typing", "hello"], "buffered input arrives in order, nothing is eaten");
+    rl.close();
+  });
+
+  test("EOF resolves as null instead of hanging", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const rl = createInterface({ input, output, terminal: false });
+    const pending = askOnInterface(rl, "> ");
+    input.end();
+    assert.equal(await pending, null);
+  });
+});
 
 describe("repl recovery", () => {
   test("a dead bridge fails once, with the reason and the in-session fix", async () => {

@@ -72,7 +72,7 @@ export const DEFAULTS = Object.freeze({
   tools: { only: [], exclude: [] },
   compaction: { enabled: true, targetRatio: 0.6, keepTail: 6 },
   session: { persist: true },
-  ui: { color: true, streaming: true, diff: true, thinking: false, spinner: true },
+  ui: { color: true, streaming: true, diff: true, thinking: false, spinner: true, spinnerStyle: "dots" },
   plugins: { enabled: true },
 });
 

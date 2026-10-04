@@ -55,13 +55,22 @@ export function evaluateApproval(call, tool, options = {}) {
   const mode = options.mode ?? "auto";
   if (mode === "yolo") return { required: false, reason: "yolo mode", danger: false };
 
-  if (options.sessionApproved?.has(call.name) && call.name !== "bash") {
-    return { required: false, reason: "approved for this session", danger: false };
-  }
-
+  // A destructive command outranks every grant: "always" remembers a command
+  // shape, not a licence to run anything at all.
   const danger = call.name === "bash" ? isDangerousCommand(String(call.arguments?.command ?? "")) : false;
   if (danger) {
     return { required: mode !== "yolo", reason: "command looks destructive", danger: true };
+  }
+
+  if (call.name === "bash") {
+    // "always" on a shell command remembers that command, never the tool: the
+    // grant is keyed by the command's shape (`npm test`, `git status`, `ls`).
+    const scope = bashCommandScope(String(call.arguments?.command ?? ""));
+    if (scope && options.sessionApprovedCommands?.has(scope)) {
+      return { required: false, reason: `approved for this session (${scope})`, danger: false };
+    }
+  } else if (options.sessionApproved?.has(call.name)) {
+    return { required: false, reason: "approved for this session", danger: false };
   }
 
   if (mode === "ask") return { required: true, reason: "approval mode is `ask`", danger: false };
@@ -117,6 +126,38 @@ export function isReadOnlyCommand(command) {
   // agent verifies its own work, and gating them defeats the purpose.
   return true;
 }
+
+/**
+ * The shape of a shell command, used as the key for a session-wide "always".
+ *
+ * `npm test -- --watch` and `npm test` share a scope; `npm test` and
+ * `npm install evil` do not. Compounds (`a && b`, pipelines) deliberately get
+ * no scope at all: remembering one would remember a whole line of behaviour.
+ *
+ * @returns {string} "" when the command must be approved every single time
+ */
+export function bashCommandScope(command) {
+  const text = String(command ?? "").trim();
+  if (!text) return "";
+  if (/[;&|<>\n`]|\$\(/.test(text)) return ""; // compounds, pipes, redirects, substitution
+  if (isDangerousCommand(text)) return "";
+  const tokens = text.split(/\s+/).filter(Boolean);
+  // Skip leading environment assignments: `NODE_ENV=test npm test`.
+  let index = 0;
+  while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) index++;
+  const program = tokens[index];
+  if (!program) return "";
+  const sub = tokens[index + 1] ?? "";
+  if (MULTI_WORD_PROGRAMS.has(program) && /^[a-z][a-z0-9-]*$/i.test(sub)) return `${program} ${sub}`;
+  return program;
+}
+
+/** Programs whose second word changes what they do. */
+const MULTI_WORD_PROGRAMS = new Set([
+  "npm", "npx", "yarn", "pnpm", "bun", "deno", "cargo", "go", "git", "gh",
+  "docker", "kubectl", "python", "python3", "pip", "pip3", "make", "mvn",
+  "gradle", "dotnet", "swift", "rustup", "terraform", "aws", "gcloud",
+]);
 
 export function isDangerousCommand(command) {
   const text = String(command);

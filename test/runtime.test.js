@@ -6,7 +6,7 @@ import { loadConfig, saveSecrets, loadSecrets, maskSecret, deepMerge, DEFAULTS }
 import { SessionStore } from "../src/session/store.js";
 import { compact, shouldCompact, extractiveSummary } from "../src/session/compact.js";
 import { renderTranscript } from "../src/session/export.js";
-import { evaluateApproval, isReadOnlyCommand, isDangerousCommand } from "../src/core/approval.js";
+import { evaluateApproval, isReadOnlyCommand, isDangerousCommand, bashCommandScope } from "../src/core/approval.js";
 import { buildSystemPrompt, loadProjectContext, loadProjectPrompt } from "../src/prompts/system.js";
 import { startMockBridge, scripted } from "../src/mock-bridge/server.js";
 import { createToolRegistry } from "../src/tools/index.js";
@@ -185,6 +185,30 @@ describe("approval policy", () => {
       evaluateApproval(bashCall("npm install x"), undefined, { mode: "auto", cwd: "/work", sessionApproved: new Set(["bash"]) }).required,
       true,
     );
+  });
+
+  test("a remembered shell command is approved without asking again", () => {
+    const options = { mode: "auto", cwd: "/work", sessionApprovedCommands: new Set(["npm test"]) };
+    assert.equal(evaluateApproval(bashCall("npm test -- --watch"), undefined, options).required, false);
+    assert.equal(evaluateApproval(bashCall("npm test"), undefined, options).required, false);
+    assert.equal(evaluateApproval(bashCall("npm run deploy"), undefined, options).required, true, "a different npm task still asks");
+    assert.equal(evaluateApproval(bashCall("rm -rf build"), undefined, options).required, true);
+  });
+
+  test("a remembered scope never covers a destructive command", () => {
+    const options = { mode: "auto", cwd: "/work", sessionApprovedCommands: new Set(["git", "npm install"]) };
+    const decision = evaluateApproval(bashCall("git push origin main"), undefined, options);
+    assert.equal(decision.required, true);
+    assert.equal(decision.danger, true, "danger outranks a remembered grant");
+  });
+
+  test("command scopes describe the shape of a command, not its arguments", () => {
+    assert.equal(bashCommandScope("NODE_ENV=test npm test"), "npm test");
+    assert.equal(bashCommandScope("git log --oneline -5"), "git log");
+    assert.equal(bashCommandScope("ls -la"), "ls");
+    assert.equal(bashCommandScope("rm -rf /"), "", "dangerous commands are never remembered");
+    assert.equal(bashCommandScope("npm test && rm -rf x"), "", "compounds are never remembered");
+    assert.equal(bashCommandScope("cat log | grep error"), "");
   });
 
   test("read-only command detection handles pipelines and env prefixes", () => {

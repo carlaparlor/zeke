@@ -1,24 +1,31 @@
 // Renders agent events to a stream.
 //
 // One implementation serves both the interactive TUI and headless mode: the
-// difference is only which events it prints and whether it uses spinners and
-// colour. Keeping them together means headless output never drifts from what
-// the interactive session showed.
+// difference is only which events it prints, whether it animates, and whether
+// the surrounding UI draws its own live status line. Keeping them together
+// means headless output never drifts from what the interactive session showed.
 
 import { Events } from "../lib/events.js";
-import { createStyle, stripAnsi, visibleWidth, SYMBOLS, colorEnabled } from "./ansi.js";
+import { colorEnabled, fitToWidth, spinnerFrames, stripAnsi, SYMBOLS, visibleWidth } from "./ansi.js";
+import { createTheme } from "./theme.js";
+import { formatDuration, indentBlock, summarizeToolCall } from "./format.js";
 
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_FRAMES = spinnerFrames("dots");
+const SPINNER_MS = 80;
 
 /**
  * @typedef {object} RendererOptions
  * @property {NodeJS.WritableStream} [stream]
  * @property {boolean} [color]
- * @property {boolean} [verbose]      show tool output as it streams
- * @property {boolean} [thinking]     show reasoning deltas
+ * @property {number} [depth]          colour depth override
+ * @property {boolean} [verbose]       show tool output as it streams
+ * @property {boolean} [thinking]      show reasoning deltas
  * @property {boolean} [spinner]
- * @property {boolean} [quiet]        headless: final answer only
+ * @property {boolean} [quiet]         headless: final answer only
+ * @property {boolean} [liveActivity]  the surrounding UI draws the live status,
+ *                                     so tool *starts* need no transcript line
  * @property {() => number} [columns]
+ * @property {ReturnType<import("./theme.js").createTheme>} [theme]
  */
 
 /**
@@ -27,8 +34,8 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
  */
 export function createRenderer(events, options = {}) {
   const stream = options.stream ?? process.stdout;
-  const color = options.color ?? colorEnabled(stream);
-  const paint = color ? createStyle(true) : plainStyle();
+  const theme = options.theme ?? createTheme({ color: options.color ?? colorEnabled(stream), depth: options.depth });
+  const paint = theme.paint;
   // A spinner is only meaningful on a terminal: on a pipe the escape
   // sequences would end up in the captured output.
   const interactive = Boolean(stream?.isTTY);
@@ -55,11 +62,12 @@ export function createRenderer(events, options = {}) {
     spinnerTimer = setInterval(() => {
       spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
       drawSpinner();
-    }, 90);
+    }, SPINNER_MS);
+    spinnerTimer.unref?.();
   }
 
   function drawSpinner() {
-    stream.write(`\r\u001b[2K${paint.cyan(SPINNER_FRAMES[spinnerFrame])} ${dim(spinnerLabel)}`);
+    stream.write(`\r\u001b[2K${theme.accent(SPINNER_FRAMES[spinnerFrame])} ${dim(spinnerLabel)}`);
   }
 
   function stopSpinner() {
@@ -101,9 +109,7 @@ export function createRenderer(events, options = {}) {
         if (options.streamAnswer === false) return;
       }
       stopSpinner();
-      if (!inAssistantText) {
-        inAssistantText = true;
-      }
+      inAssistantText = true;
       write(data.text);
     }),
   );
@@ -112,17 +118,23 @@ export function createRenderer(events, options = {}) {
     events.on(Events.MODEL_THINKING_DELTA, (data) => {
       if (!options.thinking || options.quiet) return;
       stopSpinner();
-      write(paint.gray(data.text));
+      write(paint.italic(theme.faint(data.text)));
     }),
   );
 
   unsubscribes.push(
     events.on(Events.TOOL_CALL_START, (data) => {
+      // With a live status line (the TUI) the in-flight tool is already on
+      // screen; writing a start line as well would duplicate every call.
+      if (options.liveActivity) {
+        startSpinner(data.toolCall?.name ?? "tool");
+        return;
+      }
       ensureNotInText();
       stopSpinner();
-      const summary = data.toolCall.name;
-      line(`${paint.cyan(SYMBOLS.arrow)} ${paint.bold(summary)} ${dim("…")}`);
-      startSpinner(summary);
+      const { name, detail } = summarizeToolCall(data.toolCall, null);
+      line(`${theme.tool(`${SYMBOLS.tool} ${name}`)}${detail ? ` ${theme.faint(detail)}` : ""}`);
+      startSpinner(name);
     }),
   );
 
@@ -130,7 +142,9 @@ export function createRenderer(events, options = {}) {
     events.on(Events.TOOL_CALL_OUTPUT, (data) => {
       if (!options.verbose || options.quiet) return;
       stopSpinner();
-      write(dim(indent(stripAnsi(data.text), "    ")));
+      const text = indentBlock(stripAnsi(String(data.text ?? "")), "     ");
+      write(colorizeOutput(theme, text));
+      if (!text.endsWith("\n")) write("\n");
       toolOutputPending = true;
     }),
   );
@@ -139,18 +153,20 @@ export function createRenderer(events, options = {}) {
     events.on(Events.TOOL_CALL_END, (data) => {
       ensureNotInText();
       stopSpinner();
-      const tool = data.toolCall.name;
-      const failed = data.result?.isError;
-      const marker = failed ? paint.red(SYMBOLS.cross) : paint.green(SYMBOLS.check);
-      const summary = summarizeTool(data.toolCall, data.result);
-      line(`  ${marker} ${dim(tool)} ${dim(summary)} ${dim(`(${formatDuration(data.durationMs)})`)}`);
+      const { name, detail, extra } = summarizeToolCall(data.toolCall, data.result);
+      const failed = Boolean(data.result?.isError);
+      const marker = failed ? theme.err(SYMBOLS.cross) : theme.ok(SYMBOLS.check);
+      const parts = [theme.tool(name), detail ? theme.faint(detail) : "", extra ? theme.faint(extra) : "", theme.faint(formatDuration(data.durationMs))]
+        .filter(Boolean)
+        .join(theme.faint(" · "));
+      line(`  ${marker} ${parts}`);
 
       if (failed) {
         const message = String(data.result?.content ?? "").split("\n")[0];
-        line(`    ${paint.red(message.slice(0, 240))}`);
+        line(`    ${theme.err(message.slice(0, 240))}`);
       } else if (options.verbose && !options.quiet && data.result?.content) {
         const preview = String(data.result.content).split("\n").slice(0, 12);
-        for (const l of preview) line(`    ${dim(l.slice(0, 200))}`);
+        for (const text of preview) line(`    ${colorizeOutput(theme, text.slice(0, 200))}`);
       }
       toolOutputPending = false;
     }),
@@ -160,7 +176,7 @@ export function createRenderer(events, options = {}) {
     events.on(Events.MODEL_ERROR, (data) => {
       ensureNotInText();
       stopSpinner();
-      line(`${paint.yellow(SYMBOLS.warn)} ${data.error.message}`);
+      line(`${theme.warn(SYMBOLS.warn)} ${theme.warn(data.error?.message ?? "model request failed")}`);
     }),
   );
 
@@ -198,6 +214,7 @@ export function createRenderer(events, options = {}) {
     rule,
     dim,
     paint,
+    theme,
     get busy() {
       return spinnerTimer !== null;
     },
@@ -211,49 +228,15 @@ export function createRenderer(events, options = {}) {
   };
 }
 
-function plainStyle() {
-  return new Proxy({}, { get: () => (text) => String(text) });
+/**
+ * Colour a block of tool output. A unified diff reads as a diff (green adds,
+ * red deletes); anything else is secondary information and gets dimmed.
+ */
+function colorizeOutput(theme, text) {
+  const lines = String(text ?? "").split("\n");
+  const looksLikeDiff = lines.some((line) => /^\s*[+-]{3} /.test(line) || /^\s*@@ /.test(line));
+  if (!looksLikeDiff) return lines.map((line) => theme.dim(line)).join("\n");
+  return lines.map((line) => (/^\s*(?:\+{3}|-{3}|@@|[+-])/.test(line) ? theme.diffLine(line) : theme.dim(line))).join("\n");
 }
 
-function indent(text, prefix) {
-  return text
-    .split("\n")
-    .map((l) => `${prefix}${l}`)
-    .join("\n");
-}
-
-function summarizeTool(toolCall, result) {
-  const args = toolCall.arguments ?? {};
-  const content = String(result?.content ?? "");
-  const detail =
-    {
-      read: () => args.path,
-      write: () => args.path,
-      edit: () => args.path,
-      glob: () => args.pattern,
-      grep: () => `/${args.pattern}/`,
-      bash: () => String(args.command ?? "").slice(0, 90),
-      ask: () => String(args.question ?? "").slice(0, 70),
-      todo: () => args.action,
-    }[toolCall.name] ?? (() => "");
-
-  const extra = (() => {
-    if (result?.details?.added !== undefined) return `+${result.details.added}/-${result.details.removed}`;
-    if (result?.details?.matches !== undefined) return `${result.details.matches} matches`;
-    if (result?.details?.count !== undefined) return `${result.details.count} files`;
-    if (result?.details?.lines !== undefined) return `${result.details.lines} lines`;
-    if (result?.details?.exitCode !== undefined) return `exit ${result.details.exitCode}`;
-    const chars = content.length;
-    return chars ? `${chars} chars` : "";
-  })();
-
-  return [detail(), extra].filter(Boolean).join(" · ");
-}
-
-function formatDuration(ms) {
-  if (ms === undefined || ms === null) return "";
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
-}
-
-export { visibleWidth, stripAnsi };
+export { summarizeToolCall, fitToWidth, visibleWidth };

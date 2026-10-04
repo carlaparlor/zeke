@@ -162,16 +162,28 @@ output, tool activity, approvals and context status together; it restores the te
 leave. Use `--no-tui` to force the scrolling, line-oriented REPL, or when working through a
 terminal wrapper that does not support alternate screens.
 
+The frame is drawn differentially (only changed rows are rewritten, so it does not flicker),
+colour depth is negotiated from the environment (24-bit → 256 → 16, `NO_COLOR` respected), and
+the transcript keeps the colour and markdown decoration the model's output deserves: headings,
+lists, fenced code, inline code and diffs are styled as they stream. A loading spinner with the
+elapsed time sits in the status line while a turn is in flight.
+
 | Key | Action |
 |---|---|
 | `Enter` | Send the current prompt |
 | `Ctrl+J` | Insert a newline in a multi-line prompt |
 | `↑` / `↓` | Browse prompt history (or move within a multi-line prompt) |
-| `PageUp` / `PageDown` | Scroll the transcript |
+| `PageUp` / `PageDown`, mouse wheel | Scroll the transcript (works during a turn too) |
+| `Shift+↑` / `Shift+↓` | Scroll half a screen |
+| `Esc` | Jump back to the live output after scrolling up |
 | `Ctrl+R` | Search and resume a saved session |
 | `Ctrl+N` | Start a distinct session without losing the current one |
+| `Ctrl+L` | Repaint after the terminal has been disturbed |
 | `Ctrl+C` | Interrupt a running turn; quit when idle |
 | `Tab` | Complete slash commands |
+
+Pasting is bracketed: a multi-line paste lands in the composer intact instead of submitting at
+the first newline.
 
 `/resume` opens the session picker; `/resume <id>` still works. `/new` starts a separate saved
 session without discarding the previous transcript. `/clear` resets only the in-memory conversation;
@@ -235,6 +247,21 @@ single user message:
 Approvals are policy, not a prompt you have to fight. `auto` (default) approves reads and
 writes and asks before `bash`; `--yolo` approves everything; `--ask` asks about everything.
 Read-only bash commands are recognised and let through; destructive ones are flagged.
+
+When a call does need a decision, the gate is one keystroke — no Enter:
+
+```
+? Allow bash?
+  $ npm test -- --runInBand
+  why: shell command
+   y  yes (once)   n  no   a  always (npm test)   e  explain
+```
+
+`a` remembers a *command shape*, never the `bash` tool: approving `npm test` covers
+`npm test -- --watch`, and still asks about `npm install left-pad` or `rm -rf build`.
+`e` shows the arguments, the tool description and what `always` would remember, then asks again.
+The line-oriented REPL (`--no-tui`) offers the same four answers typed as a line, and asks the
+question on the session's own readline so a single reader owns stdin.
 
 Restrict the set per run with `--tools read,grep` or `--no-tools` for chat only.
 
@@ -366,7 +393,7 @@ core/       types, agent loop, approval policy, ZekeRuntime
 providers/  SSE decoding, OpenAI wire format, GLM specifics
 tools/      the eight built-ins + registry
 session/    JSONL store, compaction, export
-ui/         ANSI, streaming renderer, approval prompt, keyboard-driven full-screen TUI
+ui/         ANSI + width-aware text, theme, streaming renderer, approval prompt, full-screen TUI
 cli/        argument routing, REPL, headless, setup, doctor
 plugins/    the plugin API surface
 bridge/     process management, vendoring, Go build
