@@ -73,6 +73,7 @@ export {
   refreshProxyPool,
   buildPool,
   shuffle,
+  rankCandidates,
   connectThroughProxy,
   classifyWafProbe,
   validateProxy,

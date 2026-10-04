@@ -216,12 +216,40 @@ describe("proxy command", () => {
 
       const shown = await zeke(["proxy", "list"], { cwd: box.cwd, env });
       assert.equal(shown.code, 0);
-      assert.match(shown.stdout, /2 usable http proxies cached/);
+      assert.match(shown.stdout, /2 http proxies cached/);
       assert.match(shown.stdout, new RegExp(first.url.replace(/[.:]/g, "\\$&")));
     } finally {
       await list.close();
       await first.close();
       await second.close();
+      await target.close();
+      await box.cleanup();
+    }
+  });
+
+  test("on works on a list where nothing is flagged https-capable — today's Proxifly", async () => {
+    // The regression: proxifly marks effectively the whole http list
+    // `https: false`, and treating that flag as a requirement failed `on`
+    // before a single candidate was probed. It is a hint; the probe decides.
+    const box = await sandbox();
+    const target = await startEchoServer("tunnel-works");
+    const proxy = await startConnectProxy({ rewrite: `127.0.0.1:${target.port}` });
+    const listed = { ...entry(proxy.url), https: false, anonymity: "transparent" };
+    const list = await startListServer([listed]);
+    const env = { ZEKE_HOME: box.home };
+    try {
+      const on = await zeke(["proxy", "on", "--source", list.url, "--no-validate", "--count", "1", "--no-restart"], { cwd: box.cwd, env });
+      assert.equal(on.code, 0, on.stdout + on.stderr);
+      assert.match(on.stdout, /✓ 1 usable proxy from 1 listed/);
+      const plan = await readJson(path.join(box.home, "proxy.json"));
+      assert.deepEqual(plan.candidates, [proxy.url], "an unproven flag does not keep a proxy out of the pool");
+
+      const shown = await zeke(["proxy", "list"], { cwd: box.cwd, env });
+      assert.match(shown.stdout, /1 http proxy cached/);
+      assert.match(shown.stdout, /no-https/);
+    } finally {
+      await list.close();
+      await proxy.close();
       await target.close();
       await box.cleanup();
     }

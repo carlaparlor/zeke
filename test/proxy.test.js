@@ -25,6 +25,7 @@ import {
   planTunnels,
   proxyOverview,
   proxiflyListUrl,
+  rankCandidates,
   refreshProxyPool,
   requestRotation,
   savePlan,
@@ -73,20 +74,46 @@ describe("what the bridge can tunnel through", () => {
     assert.equal(normalizeProxyUrl("http://1.2.3.4:99999"), null);
   });
 
-  test("parseProxyList drops socks, TLS-only and non-CONNECT proxies, and dedupes", () => {
+  test("parseProxyList drops socks, TLS-only and duplicate entries, and keeps unproven ones", () => {
     const entries = parseProxyList([
       entry("1.2.3.4", 8080),
       { proxy: "socks5://1.2.3.5:1080", protocol: "socks5" },
       { proxy: "https://1.2.3.6:8443", protocol: "https" },
-      entry("1.2.3.7", 3128, { https: false }), // the proxy never proved CONNECT
+      entry("1.2.3.7", 3128, { https: false }), // proxifly never proved CONNECT
       entry("1.2.3.4", 8080), // duplicate
       entry("1.2.3.8", 8888, { https: undefined }),
     ]);
     assert.deepEqual(
       entries.map((e) => e.url),
-      ["http://1.2.3.4:8080", "http://1.2.3.8:8888"],
+      ["http://1.2.3.4:8080", "http://1.2.3.7:3128", "http://1.2.3.8:8888"],
     );
     assert.equal(entries[0].country, "US");
+  });
+
+  test("`https: false` is a hint, not a veto — today's list is nothing but those", () => {
+    // The regression that broke `zeke proxy on`: proxifly currently marks
+    // effectively the whole http list `https: false`, and gating on the flag
+    // emptied the pool before a single candidate was probed.
+    const listed = Array.from({ length: 5 }, (_, i) => entry(`10.0.1.${i + 1}`, 8000 + i, { https: false, anonymity: "transparent" }));
+    assert.equal(parseProxyList(listed).length, 5, "a list of unproven proxies is still a list to probe");
+    // The strict mode is still there for a caller that wants the claim taken
+    // as a requirement — it just is not the default any more.
+    assert.equal(parseProxyList(listed, { requireHttps: true }).length, 0);
+  });
+
+  test("rankCandidates probes what proxifly proved first, and keeps the rest behind it", () => {
+    const ranked = rankCandidates(
+      [entry("10.0.0.1", 8001, { https: false }), entry("10.0.0.2", 8002, { https: true }), entry("10.0.0.3", 8003, { https: null }), entry("10.0.0.4", 8004, { https: true })],
+      () => 0.5,
+    );
+    assert.equal(ranked.length, 4);
+    assert.deepEqual(ranked.slice(0, 2).map((e) => e.https), [true, true], "proven CONNECT first");
+    assert.deepEqual(ranked.slice(2).map((e) => e.https), [false, null], "everything else after it, in any order");
+
+    // A list with nothing proven in it still comes back whole: the flag ranks,
+    // it does not gate.
+    const unproven = Array.from({ length: 4 }, (_, i) => entry(`10.0.2.${i + 1}`, 9000 + i, { https: false }));
+    assert.equal(rankCandidates(unproven, () => 0.5).length, 4);
   });
 
   test("parseProxyList also reads the {proxies:[…]} envelope", () => {
@@ -359,6 +386,73 @@ describe("building a pool", () => {
       });
       assert.deepEqual(pool.candidates, []);
       assert.equal(pool.failed, 3);
+    } finally {
+      await box.cleanup();
+    }
+  });
+
+  test("an empty first pass reads on instead of reporting failure", async () => {
+    const box = await sandbox();
+    try {
+      const log = [];
+      let probed = 0;
+      const pool = await buildPool({
+        fetchImpl: async () => jsonResponse(payload(20, () => ({ https: false }))),
+        count: 1,
+        maxChecked: 4,
+        concurrency: 1,
+        random: () => 0.5,
+        validateImpl: async (url) => {
+          probed++;
+          return { proxy: url, ok: probed === 5, blocked: false, ms: 1, detail: probed === 5 ? "tunnel ok" : "dead" };
+        },
+        log: (line) => log.push(line),
+      });
+      assert.equal(pool.candidates.length, 1);
+      assert.equal(pool.checked, 5, "the first 4 failed, so it read further into the same list");
+      assert.equal(pool.failed, 4);
+      assert.match(log.join("\n"), /widening the search to 8/);
+    } finally {
+      await box.cleanup();
+    }
+  });
+
+  test("a spent probe budget stops the search instead of widening it", async () => {
+    const box = await sandbox();
+    try {
+      const pool = await buildPool({
+        fetchImpl: async () => jsonResponse(Array.from({ length: 400 }, (_, i) => entry(`10.${Math.floor(i / 250)}.${(i % 250) + 1}`, 8000 + i))),
+        count: 8,
+        maxChecked: 4,
+        budgetMs: 0,
+        concurrency: 1,
+        validateImpl: async (url) => ({ proxy: url, ok: false, blocked: false, ms: 1, detail: "no time left" }),
+      });
+      assert.deepEqual(pool.candidates, []);
+      assert.equal(pool.checked, 0, "a refill must not outstay its welcome in a keeper loop");
+      assert.equal(pool.available, 400);
+    } finally {
+      await box.cleanup();
+    }
+  });
+
+  test("proxies proxifly proved are probed before the ones it did not", async () => {
+    const box = await sandbox();
+    try {
+      const order = [];
+      const listed = [entry("10.0.0.1", 8001, { https: false }), entry("10.0.0.2", 8002, { https: true })];
+      await buildPool({
+        fetchImpl: async () => jsonResponse(listed),
+        count: 2,
+        maxChecked: 2,
+        concurrency: 1,
+        random: () => 0.5,
+        validateImpl: async (url) => {
+          order.push(url);
+          return { proxy: url, ok: true, blocked: false, ms: 1, detail: "tunnel ok" };
+        },
+      });
+      assert.deepEqual(order, ["http://10.0.0.2:8002", "http://10.0.0.1:8001"]);
     } finally {
       await box.cleanup();
     }
