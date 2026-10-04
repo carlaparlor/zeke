@@ -1,8 +1,11 @@
 // `zeke bridge …` — control the bridge process.
 
 import { paths } from "../lib/paths.js";
-import { health as bridgeHealth, listBridgeModels, readLogTail, readPid, restartBridge, startBridge, stopBridge } from "../bridge/bridge.js";
+import { bridgeConfigFrom, health as bridgeHealth, listBridgeModels, readLogTail, readPid, restartBridge, startBridge, stopBridge } from "../bridge/bridge.js";
+import { keeperStatus, startKeeper, stopKeeper, describeKeeperState } from "../bridge/keeper.js";
 import { style } from "../ui/ansi.js";
+
+export { bridgeConfigFrom };
 
 const ACTIONS = ["start", "stop", "restart", "status", "logs", "models"];
 
@@ -32,6 +35,16 @@ export async function bridgeCommand({ flags, positional, config }) {
       if (!state.healthy) {
         out(paint.yellow("  ! it is listening but has no Z.AI session yet — see `zeke doctor`"));
       }
+      // A bridge started by hand still deserves the supervisor: it restarts
+      // the bridge when it dies and harvests tokens before the pool runs dry.
+      if (config.bridge.keepAlive !== false) {
+        try {
+          const keeper = await startKeeper();
+          if (keeper.started) out(paint.dim(`  keeper supervising (pid ${keeper.pid}) — it ends with \`zeke bridge stop\``));
+        } catch {
+          // the keeper is an upgrade, not a requirement
+        }
+      }
       return 0;
     } catch (err) {
       out(`${paint.red("✗")} ${err.message}`);
@@ -40,6 +53,10 @@ export async function bridgeCommand({ flags, positional, config }) {
   }
 
   if (action === "stop") {
+    // The keeper goes first, or it would read the bridge's exit as a crash
+    // and start it again behind the user's back.
+    const keeper = await stopKeeper();
+    if (keeper.stopped) out(paint.dim(`  keeper stopped (pid ${keeper.pid})`));
     const result = await stopBridge(bridgeConfig);
     out(result.stopped ? `${paint.green("✓")} stopped${result.pid ? ` (pid ${result.pid})` : ""}` : `${paint.yellow("!")} ${result.reason}`);
     return result.stopped ? 0 : 1;
@@ -59,11 +76,13 @@ export async function bridgeCommand({ flags, positional, config }) {
   if (action === "status") {
     const state = await bridgeHealth(bridgeConfig);
     const pid = await readPid();
+    const keeper = await keeperStatus();
     out(`${paint.bold("bridge")} ${state.listening ? paint.green("listening") : paint.red("not running")}`);
     out(`  url      ${state.url}`);
     out(`  pid      ${pid ?? paint.dim("not started by zeke")}`);
     out(`  session  ${state.healthy ? paint.green("initialised") : paint.red("not initialised")}`);
     out(`  tokens   ${state.tokenCount < 0 ? paint.dim("unknown") : state.tokenCount}`);
+    out(`  keeper   ${keeper.running ? paint.green(`alive (pid ${keeper.pid})`) + describeKeeperState(keeper.state) : paint.dim("not running — zeke starts it whenever you run zeke")}`);
     if (state.status?.waf) {
       out(`  waf      ${state.status.waf.blocked ? paint.red(`blocked (retry ${state.status.waf.retryIn})`) : paint.green("clear")}`);
     }
@@ -97,19 +116,7 @@ export async function bridgeCommand({ flags, positional, config }) {
   return 0;
 }
 
-export function bridgeConfigFrom(config) {
-  return {
-    host: config.bridge.host,
-    port: config.bridge.port,
-    authToken: config.apiKey,
-    agentMode: config.bridge.agentMode !== false,
-    sessionPoolSize: config.bridge.sessionPoolSize,
-    sessionReuseCount: config.bridge.sessionReuseCount,
-    zaiToken: config.zaiToken ?? undefined,
-    tokenDb: paths.tokenDb(),
-    binary: config.bridge.binary ?? paths.bridgeBinary(),
-  };
-}
+
 
 function plain() {
   return new Proxy({}, { get: () => (text) => String(text) });

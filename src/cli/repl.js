@@ -14,6 +14,7 @@ import { displayPath, paths } from "../lib/paths.js";
 import { SessionStore } from "../session/store.js";
 import { listPlugins } from "../plugins/index.js";
 import { health as bridgeHealth } from "../bridge/bridge.js";
+import { keeperStatus } from "../bridge/keeper.js";
 import { bridgeCommand } from "./bridge-cli.js";
 import { GLM_MODEL_PRESETS } from "../providers/glm.js";
 import { Events } from "../lib/events.js";
@@ -39,6 +40,10 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
   let running = false;
   let verbose = Boolean(flags.verbose);
   let exitCode = 0;
+  // Whether a keeper is watching (so a dead bridge is a temporary state, not
+  // an error the user must fix). Sampled once at startup; `/bridge start`
+  // inside the session starts one too.
+  const keeperWatched = (await keeperStatus()).running;
 
   const write = (text = "") => out.write(`${text}\n`);
 
@@ -131,7 +136,11 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
       // REPL: say what fixes it here, and only mention `zeke setup` when there
       // is no bridge binary to start in the first place.
       if (existsSync(runtime.config.bridge.binary ?? paths.bridgeBinary())) {
-        write(paint.dim("hint: the bridge is not running — `/bridge start` starts it from here"));
+        if (keeperWatched) {
+          write(paint.dim("hint: the bridge went down — the keeper restarts it within a minute; `/bridge start` forces it now"));
+        } else {
+          write(paint.dim("hint: the bridge is not running — `/bridge start` starts it from here"));
+        }
       } else {
         write(paint.dim("hint: no bridge binary yet — ctrl-d, then `zeke setup` (or `/doctor` to see what is missing)"));
       }

@@ -42,6 +42,10 @@ export const paths = {
   tokenDb: () => path.join(zekeHome(), "tokens.sqlite"),
   bridgePid: () => path.join(zekeHome(), "bridge.pid"),
   bridgeLog: () => path.join(zekeHome(), "logs", "bridge.log"),
+  keeperPid: () => path.join(zekeHome(), "keeper.pid"),
+  keeperState: () => path.join(zekeHome(), "keeper.json"),
+  keeperLog: () => path.join(zekeHome(), "logs", "keeper.log"),
+  harvestLock: () => path.join(zekeHome(), "harvest.lock"),
   get vendor() {
     return path.join(ZEKE_ROOT, "vendor");
   },

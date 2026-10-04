@@ -103,6 +103,9 @@ const env = {
   ZEKE_HOME: home,
   ZEKE_BASE_URL: bridge.baseUrl,
   ZEKE_AUTH_TOKEN: "Waguri",
+  // The selftest's bridge is a mock that dies with this script; a keeper
+  // spawned for it would outlive the test and pollute the machine.
+  ZEKE_NO_KEEPER: "1",
 };
 
 process.stdout.write("zeke selftest — end-to-end against the mock bridge\n\n");

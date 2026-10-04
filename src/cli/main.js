@@ -3,6 +3,7 @@
 import { parseArgs, renderHelp } from "../lib/args.js";
 import { style } from "../ui/ansi.js";
 import { loadConfig } from "../config/index.js";
+import { ensureAlive, keeperMain } from "../bridge/keeper.js";
 import { runInteractive } from "./repl.js";
 import { runHeadless } from "./headless.js";
 import { setupCommand } from "./setup.js";
@@ -81,6 +82,14 @@ export async function main(argv) {
     return 0;
   }
 
+  if (first === "__keeper") {
+    // Hidden entry point: the detached keeper process runs this and nothing
+    // else. Not listed in help or completions — `zeke bridge stop` is the
+    // user-facing switch.
+    const config = await loadConfig({});
+    return keeperMain(config);
+  }
+
   if (isCommand) {
     const command = COMMANDS[first];
     if (!command.run) {
@@ -108,12 +117,35 @@ export async function main(argv) {
       console.error("zeke: no prompt given. Try `zeke \"explain this repo\"` or pipe text in.");
       return 2;
     }
+    await upkeep(config);
     return runHeadless(input, { config, flags, cwd });
   }
+
+  await upkeep(config);
 
   if (prompt) noteStrayCommand(prompt);
 
   return runInteractive({ config, flags, cwd, initialPrompt: prompt || undefined });
+}
+
+/**
+ * Zero-touch upkeep before a run: bring the bridge up if it is down and put
+ * the keeper (bridge + token-pool supervisor) in place. Speaks one dim line
+ * on stderr, only when it actually did something — stdout must stay clean
+ * for headless output, and a failure must not stand in the way of the run,
+ * which will produce a far more specific error of its own.
+ */
+async function upkeep(config) {
+  const result = await ensureAlive({ config });
+  if (result.bridge === "started") {
+    process.stderr.write(
+      `${style.dim("bridge was down — started it; a background keeper keeps it up and harvests device tokens before the pool runs dry")}\n`,
+    );
+  } else if (result.bridge === "failed") {
+    process.stderr.write(
+      `${style.dim(`note: could not start the bridge (${result.detail}) — continuing; /doctor and /bridge start can take it from here`)}\n`,
+    );
+  }
 }
 
 /**
@@ -188,6 +220,10 @@ function usage() {
     "First time:",
     "  zeke setup                  build the bridge, configure tokens, verify",
     "  zeke doctor                 diagnose an existing install",
+    "",
+    "After that it runs itself: every zeke run starts the bridge if needed, and a",
+    "background keeper restarts it when it dies and harvests device tokens before",
+    "the pool runs dry. `zeke bridge stop` pauses all of that until you start it.",
     "",
     "Commands:",
     ...Object.entries(COMMANDS)

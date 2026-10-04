@@ -53,6 +53,13 @@ export const DEFAULTS = Object.freeze({
     port: 3001,
     agentMode: true,
     autoStart: true,
+    // The keeper: a background supervisor that starts the bridge on demand,
+    // restarts it when it dies, and harvests device tokens before the pool
+    // runs dry. One off-switch: `zeke bridge stop`.
+    keepAlive: true,
+    minTokens: 5, // harvest when the pool drops below this
+    checkSeconds: 20, // how often the keeper looks
+    harvest: { tokens: 500, batch: 2, parallel: 1 }, // flags for the collector
     sessionPoolSize: 5,
     sessionReuseCount: 10,
   },
@@ -146,7 +153,9 @@ export async function loadConfig(options = {}) {
   // does. When the URL came from the environment or an explicit override,
   // derive host and port from it so the two can never disagree.
   const bridgeTarget = parseBaseUrl(baseUrl);
-  const bridgeResolved = { ...DEFAULTS.bridge, ...bridge };
+  // deepMerge, not spread: a user override like `harvest.tokens` must not
+  // wipe the rest of the keeper's harvest settings.
+  const bridgeResolved = deepMerge(structuredClone(DEFAULTS.bridge), bridge);
   if (bridgeTarget) {
     bridgeResolved.host = bridgeTarget.host;
     bridgeResolved.port = bridgeTarget.port;

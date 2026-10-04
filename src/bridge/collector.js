@@ -96,7 +96,12 @@ async function browserCache() {
  * Run the collector the only way that works — from $ZEKE_HOME, so its
  * `./tokens.sqlite` lands where the bridge looks.
  *
- * @param {{args?: string[], collector?: string, dbPath?: string, log?: (line: string) => void, spawnImpl?: typeof spawn}} [options]
+ * Interactive by default: the collector *is* a TUI, so it inherits the
+ * terminal and zeke only wraps it. With `quiet: true` it runs headlessly
+ * (`--no-tui`, output piped back through `onOutput`) — that is the mode the
+ * keeper uses, where there is no terminal to inherit.
+ *
+ * @param {{args?: string[], collector?: string, dbPath?: string, quiet?: boolean, onOutput?: (chunk: string) => void, log?: (line: string) => void, spawnImpl?: typeof spawn}} [options]
  * @returns {Promise<{code: number, dbPath: string, harvested: boolean}>}
  */
 export async function runCollector(options = {}) {
@@ -105,17 +110,25 @@ export async function runCollector(options = {}) {
   const log = options.log ?? (() => {});
   const spawnImpl = options.spawnImpl ?? spawn;
 
-  // The collector *is* the TUI, so it inherits the terminal; zeke only wraps it.
   await mkdir(paths.home, { recursive: true });
-  log(`running ${collector} ${(options.args ?? []).join(" ")}`.trim());
+  const args = [...(options.args ?? [])];
+  if (options.quiet && !args.includes("--no-tui")) args.push("--no-tui");
+  log(`running ${collector} ${args.join(" ")}`.trim());
   log(`harvesting into ${dbPath} (the collector writes ./tokens.sqlite in its cwd)`);
 
+  const child = spawnImpl(collector, args, {
+    stdio: options.quiet ? ["ignore", "pipe", "pipe"] : "inherit",
+    cwd: paths.home,
+    env: { ...process.env, DB_PATH: dbPath },
+  });
+  if (options.quiet) {
+    const onOutput = options.onOutput ?? (() => {});
+    for (const stream of [child.stdout, child.stderr]) {
+      stream?.on("data", (chunk) => onOutput(String(chunk)));
+    }
+  }
+
   const code = await new Promise((resolve) => {
-    const child = spawnImpl(collector, options.args ?? [], {
-      stdio: "inherit",
-      cwd: paths.home,
-      env: { ...process.env, DB_PATH: dbPath },
-    });
     child.on("error", (err) => {
       process.stdout.write(`${err.message}\n`);
       resolve(127);
@@ -143,6 +156,8 @@ export async function harvestTokens(options) {
     args: options.args ?? collectArgs(options.flags),
     collector: options.collector,
     log,
+    quiet: Boolean(options.quiet),
+    onOutput: options.onOutput,
     spawnImpl: options.spawnImpl,
   });
 
