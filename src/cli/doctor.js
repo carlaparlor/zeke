@@ -4,7 +4,8 @@ import { access, stat } from "node:fs/promises";
 import { paths } from "../lib/paths.js";
 import { findGo, hasGoSource, readBuildInfo, sourceFingerprint } from "../bridge/build.js";
 import { collectReadiness } from "../bridge/collector.js";
-import { health as bridgeHealth, listBridgeModels, readLogTail, readPid } from "../bridge/bridge.js";
+import { health as bridgeHealth, listBridgeModels, readBridgeState, readLogTail, readPid } from "../bridge/bridge.js";
+import { proxyOverview } from "../bridge/proxy.js";
 import { createGlmProvider } from "../providers/glm.js";
 import { loadSecrets, maskSecret } from "../config/index.js";
 import { style } from "../ui/ansi.js";
@@ -143,13 +144,51 @@ export async function runDiagnostics({ config, deep = false }) {
       );
     }
 
+    // The egress proxy, when it is on: is the relay there, does it have
+    // addresses, and is the running bridge actually pointed at it.
+    const proxyPolicy = config.bridge?.proxy ?? {};
+    if (proxyPolicy.enabled === true) {
+      const overview = await proxyOverview(config);
+      const relay = overview.relay;
+      push(
+        "egress relay",
+        relay.running ? "ok" : "fail",
+        relay.running ? `127.0.0.1:${relay.port} → ${relay.current ?? "no proxy in use (direct fallback)"}` : "not running",
+        relay.running ? undefined : "`zeke proxy on` (re)starts it; `zeke proxy off` drops back to a direct connection",
+      );
+      push(
+        "proxy pool",
+        overview.candidates.length >= 2 ? "ok" : overview.candidates.length ? "warn" : "fail",
+        overview.candidates.length ? `${overview.candidates.length} proven against chat.z.ai` : "empty",
+        // One proxy is a rotation without a destination: it works until that
+        // proxy dies or is blocked, so it gets the same advice as an empty pool.
+        overview.candidates.length >= 2 ? undefined : "the keeper refills it on its next cycle; `zeke proxy fetch --validate` does it now",
+      );
+      const bridgeState = await readBridgeState();
+      const wanted = relay.port ? `http://127.0.0.1:${relay.port}` : null;
+      const tunnelling = Boolean(bridgeState?.proxyUrl) && (!wanted || bridgeState.proxyUrl === wanted);
+      push(
+        "bridge egress",
+        tunnelling ? "ok" : "warn",
+        bridgeState?.proxyUrl ? `tunnelling through ${bridgeState.proxyUrl}` : "direct — the bridge was started before the relay",
+        tunnelling ? undefined : "`zeke bridge restart` (or the keeper, within a cycle) restarts it through the relay",
+      );
+    }
+
     const waf = live.status?.waf;
     if (waf) {
+      const hint = waf.blocked
+        ? proxyPolicy.enabled === true
+          ? "proxying is on — `zeke proxy next` moves the egress now, otherwise the keeper rotates within a cycle"
+          : "a different egress IP fixes it immediately: `zeke proxy on` buys one from Proxifly's free list and rotates on blocks"
+        : undefined;
       push(
         "waf breaker",
         waf.blocked ? "fail" : "ok",
-        waf.blocked ? `chat.z.ai has blocked this IP; retry in ${waf.retryIn}` : "clear",
-        waf.blocked ? "the bridge backs off and resumes by itself; a different egress IP fixes it immediately" : undefined,
+        waf.blocked
+          ? `chat.z.ai has blocked this IP${proxyPolicy.enabled === true ? " — the egress proxy is on" : ""}; retry in ${waf.retryIn}`
+          : "clear",
+        hint,
       );
     }
     const pool = live.status?.sessionPool;

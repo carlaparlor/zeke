@@ -309,6 +309,21 @@ describe("bridge environment", () => {
     assert.equal(env.SESSION_POOL_SIZE, "9");
   });
 
+  test("an egress relay is exported as every proxy spelling dialUTLS reads", () => {
+    // The bridge's dialUTLS tries HTTPS_PROXY, HTTP_PROXY, ALL_PROXY and the
+    // lowercase forms, in that order — all six must point at the relay.
+    const env = bridgeEnv({ proxyUrl: "http://127.0.0.1:3010" });
+    for (const name of ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"]) {
+      assert.equal(env[name], "http://127.0.0.1:3010", name);
+    }
+  });
+
+  test("no relay means no proxy env, so the machine's own settings survive", () => {
+    const env = bridgeEnv({});
+    assert.equal(env.HTTPS_PROXY, process.env.HTTPS_PROXY);
+    assert.equal(env.HTTP_PROXY, process.env.HTTP_PROXY);
+  });
+
   test("CI is forced on so child tools do not prompt", async () => {
     const box = await sandbox();
     try {

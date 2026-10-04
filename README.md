@@ -154,6 +154,72 @@ only bridges on loopback that it could have started itself.
 
 ---
 
+## When the WAF blocks you
+
+chat.z.ai sits behind Aliyun's WAF, and it blocks *addresses*: `503` + `Retry-After`, an HTML
+block page on `/api/v2/chat/completions`, and the bridge's own breaker backs off — 60s, doubling
+to 30 minutes — while every request from that IP keeps failing. Waiting is the only thing the
+bridge can do about it. Zeke can change the address instead:
+
+```sh
+zeke proxy on        # download a free-proxy list, prove candidates work, start tunnelling
+zeke proxy status    # where the egress is, what the pool looks like, what has been rotated
+zeke proxy next      # move to the next proven proxy *now* (the keeper does this on its own)
+zeke proxy off       # back to this machine's own address
+```
+
+Under the hood: `zeke proxy on` downloads [Proxifly's free proxy
+list](https://github.com/proxifly/free-proxy-list) (~46k proxies, revalidated every five
+minutes), keeps the `http://` ones that can do `CONNECT`, **probes each candidate against the
+very endpoint the WAF blocks** — a proxy whose own IP is blocked is worthless and is dropped
+— then starts a loopback relay (`127.0.0.1:3010`) and restarts the bridge with `HTTPS_PROXY`
+pointed at it. From then on the bridge's uTLS dialer tunnels only `chat.z.ai` through the
+relay; everything else still goes direct.
+
+The keeper watches the bridge's WAF state and rotates the egress automatically: a block is
+answered with a fresh proxy (up to `maxRotationsPerBlock`, at most one every
+`rotateIntervalSeconds`), and a thin pool is refilled in the background. Inside a session,
+`/proxy` runs the same actions — `/proxy status`, `/proxy on`, `/proxy next` — which is where
+a `503` usually shows up.
+
+Why only `http://` proxies: the bridge's `dialUTLS` opens a plain TCP connection to the proxy
+and speaks HTTP `CONNECT` (that is what keeps the uTLS fingerprint intact end to end). Socks4,
+socks5 and TLS-to-the-proxy cannot be used, so zeke filters them out no matter what the list
+offers. `zeke proxy on --protocol socks5` is refused rather than silently broken.
+
+Config (all under `bridge.proxy` in `$ZEKE_HOME/config.json`, written by `zeke proxy on`):
+
+```jsonc
+{
+  "bridge": {
+    "proxy": {
+      "enabled": false,        // the master switch (`zeke proxy on|off`)
+      "port": 3010,            // the relay's loopback port (falls back to a free one)
+      "url": null,             // pin one proxy: "http://host:port"
+      "rotate": "on-block",    // "on-block" | "per-request"
+      "protocol": "http",      // which Proxifly list to draw from (http is the usable one)
+      "country": null,         // ISO code, e.g. "US" — match the collector's US locale
+      "mirror": "cdn",         // "cdn" (jsDelivr) | "raw" (GitHub)
+      "listUrl": null,         // download from here instead of the mirrors
+      "hosts": ["chat.z.ai"],  // upstreams to tunnel; everything else connects directly
+      "fallbackDirect": true,  // if no proxy answers, connect directly instead of failing
+      "validate": true,        // probe candidates against chat.z.ai before trusting them
+      "pool": { "count": 8, "maxChecked": 48, "refreshSeconds": 900 }
+    }
+  }
+}
+```
+
+The pool, the plan the relay follows and the last downloaded list live in `$ZEKE_HOME`
+(`proxies.json`, `proxy.json`, `egress.json`); `zeke proxy status --json` prints the lot. Two
+notes from experience: free proxies die constantly, so a pool is a *provisional* set — the
+keeper refills it and the relay retires a proxy after `maxFailures` — and `https` in Proxifly's
+data means "this proxy can reach an https target" (it says nothing about TLS to the proxy
+itself, which zeke cannot use). Successful tunnels are byte-for-byte, so the browser
+fingerprint, cookies and device tokens are exactly the same as a direct connection.
+
+---
+
 ## Using it
 
 **Interactive** — `zeke` starts a keyboard-driven, full-screen session when stdin and stdout
@@ -226,7 +292,7 @@ Exit codes are meaningful: `0` ok, `1` error, `3` hit `--max-turns`, `130` inter
 | `/compact` | `/clear` | `/copy` |
 | `/session` | `/sessions` | `/resume` |
 | `/export` | `/bridge` | `/doctor` |
-| `/plugins` | `/prompt` | `/exit` |
+| `/proxy` | `/plugins` | `/prompt` |
 
 Typing `/` previews every command with its one-line description, `↑`/`↓` move the highlight and
 `Tab` accepts it — so the list is discoverable without `/help`. `/todo` prints the todo tree and
@@ -237,6 +303,9 @@ appears: `/bridge start`, `/bridge restart`, `/bridge stop`, `/bridge logs`, `/b
 a turn fails because nothing is listening, the hint points at `/bridge start` — no need to leave
 the session to fix it. (If there is no bridge binary yet, the hint says so instead of naming a
 command that cannot work.)
+
+`/proxy` is the same tool for the other failure mode: `/proxy status`, `/proxy on`, `/proxy
+next` — see [When the WAF blocks you](#when-the-waf-blocks-you).
 
 **Project context.** Zeke loads applicable `ZEKE.md` / `AGENTS.md` files from the repository root
 through the current directory (`ZEKE.md` wins at a given level; more-local rules refine parent
@@ -347,6 +416,7 @@ zeke setup       build the bridge, configure tokens, start the keeper (start her
 zeke doctor      diagnose the whole toolchain
 zeke bridge      start | stop | restart | status | models | logs — stop ends the keeper too
 zeke tokens      collect | status | swap | teleport — collect is the manual override
+zeke proxy       status | on | off | next | list | test | fetch — free egress when the WAF blocks
 zeke config      get | set | unset | profiles
 zeke models      what the bridge offers
 zeke tools       zeke's tools and their contracts
@@ -470,7 +540,7 @@ session/    JSONL store, compaction, export, session-level todo reminders
 ui/         ANSI + width-aware text, theme, streaming renderer, approval prompt, full-screen TUI
 cli/        argument routing, REPL, headless, setup, doctor
 plugins/    the plugin API surface
-bridge/     process management, vendoring, Go build
+bridge/     process management, vendoring, Go build, the free-proxy pool and its egress relay
 ```
 
 The agent core does no rendering and no I/O. It emits events on an `EventBus`, and the TUI, the
@@ -487,7 +557,7 @@ breaker's `503` + `Retry-After` backoff.
 ## Tests
 
 ```sh
-npm test          # 468 tests in 15 files
+npm test          # 604 tests in 22 files
 npm run selftest  # end-to-end: real CLI against a mock bridge
 zeke selftest     # same suite, from an installed checkout
 ```
@@ -522,6 +592,17 @@ listening on the bridge port. Inside a session, `/bridge start` brings it up (an
 says why it stopped); from a shell, `zeke bridge start`. If it refuses to start, `/doctor` — or
 `zeke doctor --json` in CI — names the missing piece, usually a device-token pool or the Go
 toolchain that builds the bridge.
+
+**`503` + an Aliyun block page, or `waf_block` errors every turn.** The WAF has blocked this
+machine's address, and nothing zeke can do to a blocked IP helps — the bridge's breaker only
+waits it out. Give it a different address: `zeke proxy on` (or `/proxy on` inside a session)
+tunnels chat.z.ai through proven free proxies and rotates on the next block. `zeke doctor`
+reports which of the two states you are in and names the command.
+
+**A free proxy stopped working mid-session.** Expected — that is what the pool is for. The
+relay retires a proxy after `maxFailures`, reconnects through the next one, and the keeper
+refills when fewer than two are live. `zeke proxy next` forces the move; `zeke proxy test`
+says whether a specific proxy is usable right now.
 
 **An old build prints nothing at all.** Before the symlink fix, a `zeke` launched through
 `npm link` (which installs a symlink) hit the "am I the program being run?" guard with a *link*

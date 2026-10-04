@@ -53,8 +53,38 @@ export { buildSystemPrompt, findProjectRoot, loadProjectContext, loadProjectProm
 export { createPluginApi } from "./plugins/api.js";
 export { loadPlugins, listPlugins } from "./plugins/index.js";
 
-export { startBridge, stopBridge, restartBridge, health as bridgeHealth, swapTokenDb, listBridgeModels } from "./bridge/bridge.js";
+export {
+  startBridge,
+  stopBridge,
+  restartBridge,
+  health as bridgeHealth,
+  swapTokenDb,
+  listBridgeModels,
+  readBridgeState,
+  bridgeEnv,
+} from "./bridge/bridge.js";
 export { buildBridge, ensureVendored, findGo, sourceFingerprint } from "./bridge/build.js";
+export {
+  PROXIFLY_REPO,
+  normalizeProxyUrl,
+  parseProxyList,
+  proxiflyListUrl,
+  fetchProxyList,
+  refreshProxyPool,
+  buildPool,
+  shuffle,
+  connectThroughProxy,
+  classifyWafProbe,
+  validateProxy,
+  validateProxies,
+  loadPlan,
+  savePlan,
+  requestRotation,
+  loadProxyCache,
+  loadEgressState,
+  proxyOverview,
+} from "./bridge/proxy.js";
+export { createEgressServer, planRoute, egressStatus, ensureEgress, startEgress, stopEgress, egressProxyEnv } from "./bridge/egress.js";
 
 export { createRenderer } from "./ui/render.js";
 export { renderTodoTree, todoCounts, TODO_GLYPHS } from "./ui/todo-tree.js";

@@ -265,6 +265,24 @@ describe("repl recovery", () => {
 });
 
 describe("slash commands", () => {
+  test("/proxy reports the egress state, and its advice is a session command", async () => {
+    // The hint has to be runnable where it is printed: `/proxy on`, never a
+    // shell command the user would have to leave the session to type.
+    const box = await sandbox();
+    const port = await unusedPort();
+    try {
+      const result = await repl(["/proxy status", "/exit"], {
+        cwd: box.cwd,
+        env: { ZEKE_HOME: box.home, ZEKE_BASE_URL: `http://127.0.0.1:${port}/v1`, ZEKE_NO_KEEPER: "1" },
+      });
+      assert.match(result.stdout, /egress proxy off/);
+      assert.match(result.stdout, /\/proxy on/);
+      assert.doesNotMatch(result.stdout, /`zeke proxy on`/);
+    } finally {
+      await box.cleanup();
+    }
+  });
+
   test("every command is described, and every description is a command", async () => {
     const source = await readFile(new URL("../src/cli/repl.js", import.meta.url), "utf8");
     const start = source.indexOf("const commands = {");

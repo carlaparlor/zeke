@@ -234,6 +234,16 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
           "hint: the bridge has no chat.z.ai session — `/bridge restart` retries it; `zeke tokens status` checks the device-token pool",
         ),
       );
+    } else if (/blocked this server's IP|waf_block|temporarily blocked/i.test(text)) {
+      // The one failure here that a restart cannot fix: the block is on the
+      // IP, so the fix is a different address.
+      write(
+        paint.dim(
+          runtime.config.bridge.proxy?.enabled
+            ? "hint: the WAF has this IP — the keeper rotates the egress on its next cycle, or `/proxy next` moves it now"
+            : "hint: the WAF has this IP — `/proxy on` tunnels through a free proxy and rotates away from blocks",
+        ),
+      );
     }
   }
 
@@ -461,10 +471,25 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
       write(`healthy  ${state.healthy ? paint.green("yes") : paint.red("no — no Z.AI session")}`);
       write(`tokens   ${state.tokenCount < 0 ? paint.dim("unknown") : state.tokenCount}`);
       const waf = state.status?.waf;
-      if (waf?.blocked) write(`waf      ${paint.red(`blocked, retry in ${waf.retryIn}`)}`);
+      if (waf?.blocked) write(`waf      ${paint.red(`blocked, retry in ${waf.retryIn}`)}${runtime.config.bridge.proxy?.enabled ? paint.dim(" — /proxy next moves the egress now") : paint.dim(" — /proxy on tunnels around it")}`);
+      if (runtime.config.bridge.proxy?.enabled) {
+        const { proxyOverview } = await import("../bridge/proxy.js");
+        const overview = await proxyOverview(runtime.config);
+        write(`egress   ${overview.relay.running ? `${overview.relay.current ?? paint.yellow("direct fallback")} (relay :${overview.relay.port}, ${overview.candidates.length} in pool)` : paint.red("relay not running — /proxy on")}`);
+      }
       const pool = state.status?.sessionPool;
       if (pool) write(`pool     ${pool.ready}/${pool.size} ready (mode ${pool.mode})`);
       write(paint.dim("`/bridge start|stop|restart|logs|models` controls it"));
+    },
+
+    proxy: async (arg) => {
+      // The same actions as `zeke proxy …`, reachable from where the block
+      // shows up — this is what the WAF hint above points at.
+      const [action, ...rest] = arg.trim().split(/\s+/).filter(Boolean);
+      const { proxyCommand } = await import("./proxy-cli.js");
+      // `inSession` so the advice it prints is `/proxy …`, not a shell command
+      // the reader cannot run without leaving the session.
+      await proxyCommand({ flags: {}, positional: [action ?? "status", ...rest], config: runtime.config, output: out, inSession: true });
     },
 
     doctor: async () => {
@@ -706,6 +731,7 @@ export function commandDescriptions(runtime) {
     { name: "resume", args: "[id]", usage: "/resume [id]", description: "resume a session, or open the picker" },
     { name: "export", args: "[file]", usage: "/export [file]", description: "write the transcript to a markdown file" },
     { name: "bridge", args: "[action]", usage: "/bridge [action]", description: "status, or start|stop|restart|logs|models" },
+    { name: "proxy", args: "[action]", usage: "/proxy [action]", description: "free-proxy egress: status, or on|off|next|list|test|fetch" },
     { name: "doctor", usage: "/doctor", description: "run the full diagnostic" },
     { name: "plugins", usage: "/plugins", description: "list plugins" },
     { name: "prompt", usage: "/prompt", description: "print the system prompt" },

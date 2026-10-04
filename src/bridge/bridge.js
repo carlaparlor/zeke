@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import { appendFile, chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { paths } from "../lib/paths.js";
+import { egressProxyEnv } from "./egress.js";
 
 const DEFAULT_PORT = 3001;
 
@@ -23,11 +24,21 @@ const DEFAULT_PORT = 3001;
  * @property {string} [zaiToken]    Z.AI JWT from chat.z.ai
  * @property {string} [tokenDb]     path to tokens.sqlite
  * @property {string} [goRoot]      Go toolchain root, when not on PATH
+ * @property {string} [proxyUrl]    egress relay to tunnel through (see bridge/egress.js)
  * @property {string[]} [extraEnv]
  * @property {NodeJS.WritableStream} [logStream]
  */
 
-/** Environment the bridge process gets. */
+/**
+ * Environment the bridge process gets.
+ *
+ * `proxyUrl`, when set, is the local egress relay. The bridge's uTLS dialer
+ * (`dialUTLS` in the vendored Go source) reads HTTPS_PROXY/HTTP_PROXY/ALL_PROXY
+ * once per dial, so every dial goes to the relay and the relay decides which
+ * upstream proxy that dial leaves from — which is how the egress IP changes
+ * without the bridge ever hearing about it. All six spellings are set, so
+ * whatever else is exported on this machine the answer stays the same.
+ */
 export function bridgeEnv(config = {}) {
   const env = {
     ...process.env,
@@ -47,6 +58,7 @@ export function bridgeEnv(config = {}) {
     env.GOROOT = config.goRoot;
     env.PATH = `${path.join(config.goRoot, "bin")}${path.delimiter}${env.PATH ?? ""}`;
   }
+  if (config.proxyUrl) Object.assign(env, egressProxyEnv(config.proxyUrl));
   for (const entry of config.extraEnv ?? []) {
     const eq = entry.indexOf("=");
     if (eq > 0) env[entry.slice(0, eq)] = entry.slice(eq + 1);
@@ -75,6 +87,9 @@ export function bridgeConfigFrom(config) {
     zaiToken: config.zaiToken ?? undefined,
     tokenDb: paths.tokenDb(),
     binary: bridge.binary ?? paths.bridgeBinary(),
+    // Not set here on purpose: the relay's port is only known once it is up,
+    // so whoever starts the bridge resolves it first (`withEgress`).
+    proxyUrl: undefined,
   };
 }
 
@@ -127,6 +142,24 @@ export async function startBridge(config = {}) {
   if (typeof child.pid === "number") {
     await writeFile(paths.bridgePid(), `${child.pid}\n`, "utf8");
   }
+  // What this process was started with, so the keeper and `zeke doctor` can
+  // tell a bridge that tunnels through the egress relay from one that predates
+  // it and would need a restart to pick the relay up.
+  await writeFile(
+    paths.bridgeState(),
+    `${JSON.stringify(
+      {
+        pid: child.pid ?? null,
+        at: new Date().toISOString(),
+        url: bridgeBaseUrl(config),
+        proxyUrl: config.proxyUrl ?? null,
+        binary,
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
 
   // Wait for the port, not for the Z.AI session: the bridge serves /health
   // while its upstream session initialises asynchronously.
@@ -164,6 +197,7 @@ export async function stopBridge(config = {}) {
       process.kill(pid, 0);
     } catch {
       await rm(paths.bridgePid(), { force: true });
+      await rm(paths.bridgeState(), { force: true });
       return { stopped: true, pid };
     }
   }
@@ -174,7 +208,18 @@ export async function stopBridge(config = {}) {
     // already gone
   }
   await rm(paths.bridgePid(), { force: true });
+  await rm(paths.bridgeState(), { force: true });
   return { stopped: true, pid, forced: true };
+}
+
+/** What the running bridge was started with; null when zeke did not start it. */
+export async function readBridgeState() {
+  try {
+    const parsed = JSON.parse(await readFile(paths.bridgeState(), "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function restartBridge(config = {}) {
