@@ -4,10 +4,10 @@
 // the block is on the *egress IP*, so the same request from a different address
 // succeeds immediately. That is what this module supplies — a pool of proxies
 // drawn from Proxifly's free list (https://github.com/proxifly/free-proxy-list,
-// ~46k proxies revalidated every five minutes), filtered down to the ones the
-// bridge can actually use, probed against the very endpoint the WAF blocks,
-// and handed to the local egress relay (`src/bridge/egress.js`) that the
-// bridge's uTLS dialer tunnels through.
+// tens of thousands of proxies revalidated every few minutes), filtered down
+// to the ones the bridge can actually use, probed against the very endpoint
+// the WAF blocks, and handed to the local egress relay (`src/bridge/egress.js`)
+// that the bridge's uTLS dialer tunnels through.
 //
 // Two constraints, both from the upstream bridge rather than from taste,
 // shape every filter here:
@@ -16,14 +16,23 @@
 //     CONNECT. An `https://` proxy (TLS to the proxy itself) and a socks4/5
 //     proxy (a different handshake entirely) therefore cannot be used, no
 //     matter what the list offers; only `http://` proxies with CONNECT support
-//     work. The `https` flag on an http entry is exactly that capability —
-//     proxifly sets it after fetching an https URL through the proxy.
+//     work.
 //   * The Aliyun WAF blocks per path. The bridge's own prober POSTs a bare,
 //     unauthenticated body to `/api/v2/chat/completions`, and a blocked
 //     address gets the HTML block page back. A proxy that is itself blocked
 //     (free proxies are widely abused, so many are) is worthless: every
 //     candidate is probed the same way before it joins the pool, which costs
 //     nothing upstream — no captcha, no device token, no session.
+//
+// What the *list* claims about either of those is a weaker kind of evidence.
+// Proxifly's per-entry `https` flag says a proxy reached an https target when
+// proxifly scraped it — the same CONNECT capability the first bullet needs — but
+// it is a hint from a scraper, not a fact, and it is currently `false` for
+// effectively the whole http list. Gating on it emptied the pool before a single
+// candidate was probed. It therefore decides *who gets probed first*
+// (`rankCandidates`), never *who is allowed in*: the probe is the authority, and
+// a real CONNECT to chat.z.ai:443 plus a TLS handshake proves strictly more than
+// a flag set by someone else's fetch.
 //
 // Nothing in here talks to a browser or needs a Go toolchain: it is fetch,
 // sockets and JSON, all injectable so the tests never touch the network.
@@ -225,13 +234,18 @@ export function normalizeEntry(value) {
  * Parse a Proxifly JSON payload (an array, or `{proxies: […]}`), dropping
  * entries this bridge could never tunnel through.
  *
+ * What survives is "an http proxy worth probing"; whether it *can* CONNECT is
+ * settled by the probe, not by the list. See `requireHttps`.
+ *
  * @param {unknown} payload
- * @param {{requireHttps?: boolean}} [options] `requireHttps` keeps only
- *   proxies proxifly has proven can reach an https target, which is exactly
- *   the CONNECT capability `dialUTLS` needs.
+ * @param {{requireHttps?: boolean}} [options] `requireHttps` (opt-in) also
+ *   drops every entry proxifly did not prove can reach an https target, which
+ *   is a cheaper CONNECT capability. Off by default: proxifly currently marks
+ *   nearly the whole http list `https: false`, and requiring it there leaves
+ *   an empty pool and a dead `zeke proxy on`.
  */
 export function parseProxyList(payload, options = {}) {
-  const { requireHttps = true } = options;
+  const { requireHttps = false } = options;
   const list = Array.isArray(payload) ? payload : Array.isArray(payload?.proxies) ? payload.proxies : [];
   const seen = new Set();
   const entries = [];
@@ -247,9 +261,20 @@ export function parseProxyList(payload, options = {}) {
 }
 
 /**
+ * "The list came back empty" and "12 listed, none of them usable" are
+ * different failures and deserve different words.
+ */
+function describeEmptyList(payload) {
+  const list = Array.isArray(payload) ? payload : Array.isArray(payload?.proxies) ? payload.proxies : null;
+  if (!list) return "the response was not a Proxifly list";
+  if (!list.length) return "the list is empty";
+  return `${list.length} listed, none of them an http proxy that can CONNECT`;
+}
+
+/**
  * Fetch and parse a Proxifly list.
  *
- * @param {{protocol?: string, country?: string|null, all?: boolean, mirror?: string, timeoutMs?: number, fetchImpl?: typeof fetch}} [options]
+ * @param {{protocol?: string, country?: string|null, all?: boolean, mirror?: string, timeoutMs?: number, requireHttps?: boolean, fetchImpl?: typeof fetch}} [options]
  * @returns {Promise<{entries: any[], source: string, fetchedAt: string}>}
  */
 export async function fetchProxyList(options = {}) {
@@ -260,8 +285,9 @@ export async function fetchProxyList(options = {}) {
   try {
     const response = await doFetch(source, { signal: controller.signal, headers: { accept: "application/json" } });
     if (!response.ok) throw new Error(`HTTP ${response.status} from ${source}`);
-    const entries = parseProxyList(await response.json(), { requireHttps: options.requireHttps !== false });
-    if (!entries.length) throw new Error(`${source} returned no usable http proxies`);
+    const payload = await response.json();
+    const entries = parseProxyList(payload, { requireHttps: options.requireHttps === true });
+    if (!entries.length) throw new Error(`${source} returned no usable http proxies (${describeEmptyList(payload)})`);
     return { entries, source, fetchedAt: new Date().toISOString() };
   } catch (err) {
     if (err?.name === "AbortError") throw new Error(`timed out fetching ${source}`);
@@ -612,17 +638,43 @@ export function shuffle(list, random = Math.random) {
 }
 
 /**
+ * The order candidates are probed in: everything proxifly has *proved* can
+ * reach an https target first, everything it could not prove after, each tier
+ * shuffled so consecutive refills land on different addresses.
+ *
+ * The flag is a ranking hint and nothing more — see the module header. Ranking
+ * on it keeps the old preference wherever the data is still trustworthy, and
+ * costs nothing where it is not, because both tiers are probed the same way.
+ */
+export function rankCandidates(entries, random = Math.random) {
+  const proven = [];
+  const unproven = [];
+  for (const entry of entries) (entry.https === true ? proven : unproven).push(entry);
+  return [...shuffle(proven, random), ...shuffle(unproven, random)];
+}
+
+/**
+ * How long one build may spend probing, across every pass. A refill runs inside
+ * a CLI command and inside the keeper's loop, so "try more of the list" has to
+ * end somewhere: past the deadline a pass stops even with budget left, and the
+ * caller is told what it got rather than left waiting.
+ */
+export const PROBE_BUDGET_MS = 90_000;
+
+/**
  * Assemble a pool of proxies that have *just* been proven to work: fetch the
- * list (or reuse a fresh cache), shuffle it so consecutive refills land on
- * different addresses, then probe candidates until `count` pass or the
- * budget runs out.
+ * list (or reuse a fresh cache), rank it (see `rankCandidates`), then probe
+ * candidates until `count` pass or the budget runs out.
  *
  * Probing is the slow part (a CONNECT plus a TLS handshake each, a few
  * seconds when a proxy is dead), which is why it is batched and budgeted
- * rather than exhaustive.
+ * rather than exhaustive. An empty first pass widens the search once rather
+ * than reporting failure: the list is thousands of entries long and free
+ * proxies die, so a slice of it failing is a reason to read more, not to tell
+ * the user to come back later.
  *
  * @param {{protocol?: string, country?: string|null, mirror?: string, listUrl?: string|null, count?: number,
- *   maxChecked?: number, concurrency?: number, timeoutMs?: number, force?: boolean,
+ *   maxChecked?: number, concurrency?: number, timeoutMs?: number, budgetMs?: number, force?: boolean,
  *   requireHttps?: boolean, refreshSeconds?: number, log?: (line: string) => void,
  *   random?: () => number, validate?: boolean, fetchImpl?: typeof fetch,
  *   validateImpl?: typeof validateProxy}} [options]
@@ -633,33 +685,52 @@ export async function buildPool(options = {}) {
   const maxChecked = Math.max(count, Number(options.maxChecked ?? 48));
   const random = options.random ?? Math.random;
   const validate = options.validateImpl ?? validateProxy;
+  const concurrency = Math.max(1, Number(options.concurrency ?? 4));
+  const timeoutMs = Number(options.timeoutMs ?? 6000);
 
   const list = await refreshProxyPool({ ...options, log });
-  const candidates = shuffle(list.entries, random).slice(0, maxChecked);
+  const ordered = rankCandidates(list.entries, random);
   const pool = { candidates: [], checked: 0, blocked: 0, failed: 0, available: list.entries.length };
   if (options.validate === false) {
-    pool.candidates = candidates.slice(0, count).map((entry) => entry.url);
+    pool.candidates = ordered.slice(0, count).map((entry) => entry.url);
     pool.skippedValidation = pool.candidates.length;
     return { ...pool, source: list.source, fetchedAt: list.fetchedAt, cached: Boolean(list.cached) };
   }
 
+  const deadline = Date.now() + Math.max(0, Number(options.budgetMs ?? PROBE_BUDGET_MS));
+  let candidates = ordered.slice(0, Math.min(ordered.length, maxChecked));
   let cursor = 0;
-  const workers = Array.from({ length: Math.max(1, Math.min(options.concurrency ?? 4, candidates.length)) }, async () => {
-    while (cursor < candidates.length && pool.candidates.length < count) {
-      const entry = candidates[cursor++];
-      const result = await validate(entry.url, { timeoutMs: options.timeoutMs ?? 6000, netConnectImpl: options.netConnectImpl, tlsConnectImpl: options.tlsConnectImpl, probeImpl: options.probeImpl });
-      pool.checked++;
-      if (result.ok) {
-        pool.candidates.push(entry.url);
-        log(`proxy ✓ ${entry.url}${entry.country ? ` (${entry.country})` : ""} — ${result.detail} [${result.ms}ms]`);
-      } else {
-        if (result.blocked) pool.blocked++;
-        else pool.failed++;
-        if (result.blocked) log(`proxy ✗ ${entry.url} — its IP is WAF-blocked too`);
+
+  /** Probe from wherever the cursor stopped, `concurrency` at a time. */
+  async function probeUntilFull() {
+    const workers = Array.from({ length: Math.max(1, Math.min(concurrency, candidates.length)) }, async () => {
+      while (pool.candidates.length < count && cursor < candidates.length && Date.now() < deadline) {
+        const entry = candidates[cursor++];
+        const result = await validate(entry.url, { timeoutMs, netConnectImpl: options.netConnectImpl, tlsConnectImpl: options.tlsConnectImpl, probeImpl: options.probeImpl });
+        pool.checked++;
+        if (result.ok) {
+          pool.candidates.push(entry.url);
+          log(`proxy ✓ ${entry.url}${entry.country ? ` (${entry.country})` : ""} — ${result.detail} [${result.ms}ms]`);
+        } else {
+          if (result.blocked) pool.blocked++;
+          else pool.failed++;
+          if (result.blocked) log(`proxy ✗ ${entry.url} — its IP is WAF-blocked too`);
+        }
       }
-    }
-  });
-  await Promise.all(workers);
+    });
+    await Promise.all(workers);
+  }
+
+  await probeUntilFull();
+  if (!pool.candidates.length && cursor < ordered.length && Date.now() < deadline) {
+    // Nothing in the first slice. Read further into the same shuffled list —
+    // at most double it, so a refill can never turn into a scan of the whole
+    // list — and let the deadline stop it if the extra probes are slow.
+    const wider = Math.min(ordered.length, Math.max(candidates.length * 2, count + 1));
+    log(`none of the first ${cursor} answered chat.z.ai — widening the search to ${wider}`);
+    candidates = ordered.slice(0, wider);
+    await probeUntilFull();
+  }
 
   return { ...pool, source: list.source, fetchedAt: list.fetchedAt, cached: Boolean(list.cached), stale: Boolean(list.stale) };
 }

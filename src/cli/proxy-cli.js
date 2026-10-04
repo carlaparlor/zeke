@@ -146,7 +146,7 @@ async function statusAction({ flags, config, out, paint, cmd }) {
 
 // ----------------------------------------------------------------------- on
 
-async function onAction({ flags, config, out, paint }) {
+async function onAction({ flags, config, out, paint, cmd }) {
   const protocol = flags.protocol ?? config.bridge.proxy.protocol ?? "http";
   if (protocol !== "http") {
     out(paint.red(`the bridge can only tunnel through an http proxy (CONNECT over plain TCP) — "${protocol}" cannot work`));
@@ -195,7 +195,9 @@ async function onAction({ flags, config, out, paint }) {
       log: (line) => out(paint.dim(`  ${line}`)),
     });
     if (!pool.candidates.length) {
-      out(`${paint.red("✗")} none of the ${pool.checked} proxies probed can reach chat.z.ai right now — the list is revalidated every 5 minutes, try again shortly`);
+      out(`${paint.red("✗")} none of the ${pool.checked} of ${pool.available} listed proxies can reach chat.z.ai right now`);
+      out(paint.dim("  free proxies die fast and the list is revalidated every few minutes — try again shortly,"));
+      out(paint.dim(`  or narrow the search: \`${cmd("on --country US")}\`, \`${cmd("on --mirror raw")}\``));
       return 1;
     }
     out(
@@ -295,7 +297,7 @@ async function listAction({ flags, config, out, paint, cmd }) {
   const wanted = flags.country ?? config.bridge.proxy.country ?? null;
   const entries = (wanted ? cache.entries.filter((entry) => (entry.country ?? "").toUpperCase() === String(wanted).toUpperCase()) : cache.entries).slice(0, limit);
   out(
-    `${paint.bold("Proxifly")} ${cache.entries.length} usable http proxies cached ${describeWhen(cache.fetchedAt)}${wanted ? ` · ${entries.length} from ${wanted}` : ""}`,
+    `${paint.bold("Proxifly")} ${cache.entries.length} http ${cache.entries.length === 1 ? "proxy" : "proxies"} cached ${describeWhen(cache.fetchedAt)}${wanted ? ` · ${entries.length} from ${wanted}` : ""}`,
   );
   if (!entries.length) {
     out(paint.dim(`  nothing from ${wanted} in this list — \`${cmd(`fetch --country ${wanted}`)}\``));
@@ -371,7 +373,7 @@ async function fetchAction({ flags, config, out, paint }) {
       refreshSeconds: 0,
       log: (line) => out(paint.dim(`  ${line}`)),
     });
-    out(`${paint.green("✓")} ${list.entries.length} usable ${protocol} proxies from ${list.source}`);
+    out(`${paint.green("✓")} ${list.entries.length} ${protocol} ${list.entries.length === 1 ? "proxy" : "proxies"} from ${list.source}`);
     if (flags.validate) {
       const pool = await buildPool({
         protocol,

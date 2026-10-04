@@ -169,8 +169,8 @@ zeke proxy off       # back to this machine's own address
 ```
 
 Under the hood: `zeke proxy on` downloads [Proxifly's free proxy
-list](https://github.com/proxifly/free-proxy-list) (~46k proxies, revalidated every five
-minutes), keeps the `http://` ones that can do `CONNECT`, **probes each candidate against the
+list](https://github.com/proxifly/free-proxy-list) (tens of thousands of proxies, revalidated
+every few minutes), keeps the `http://` ones, **probes each candidate against the
 very endpoint the WAF blocks** — a proxy whose own IP is blocked is worthless and is dropped
 — then starts a loopback relay (`127.0.0.1:3010`) and restarts the bridge with `HTTPS_PROXY`
 pointed at it. From then on the bridge's uTLS dialer tunnels only `chat.z.ai` through the
@@ -213,10 +213,17 @@ Config (all under `bridge.proxy` in `$ZEKE_HOME/config.json`, written by `zeke p
 The pool, the plan the relay follows and the last downloaded list live in `$ZEKE_HOME`
 (`proxies.json`, `proxy.json`, `egress.json`); `zeke proxy status --json` prints the lot. Two
 notes from experience: free proxies die constantly, so a pool is a *provisional* set — the
-keeper refills it and the relay retires a proxy after `maxFailures` — and `https` in Proxifly's
-data means "this proxy can reach an https target" (it says nothing about TLS to the proxy
-itself, which zeke cannot use). Successful tunnels are byte-for-byte, so the browser
-fingerprint, cookies and device tokens are exactly the same as a direct connection.
+keeper refills it and the relay retires a proxy after `maxFailures` — and Proxifly's `https`
+flag ("this proxy reached an https target when we scraped it") is a hint zeke *ranks* by, not
+a rule it filters on. It says nothing about TLS to the proxy itself, which zeke cannot use
+anyway, and proxifly currently marks nearly the whole `http` list `https: false` — treating
+that as a requirement leaves an empty pool. Whether a proxy can `CONNECT` is settled by the
+probe, which is a stronger test anyway: a real tunnel to `chat.z.ai:443` plus a TLS handshake
+proves more than a flag someone else's fetch set. If that first slice of the list comes back
+empty, zeke reads further into it rather than telling you to come back later, and gives the
+whole search a wall-clock budget so a refill cannot hang a CLI command or the keeper.
+Successful tunnels are byte-for-byte, so the browser fingerprint, cookies and device tokens
+are exactly the same as through a direct connection.
 
 ---
 
@@ -603,6 +610,13 @@ reports which of the two states you are in and names the command.
 relay retires a proxy after `maxFailures`, reconnects through the next one, and the keeper
 refills when fewer than two are live. `zeke proxy next` forces the move; `zeke proxy test`
 says whether a specific proxy is usable right now.
+
+**`zeke proxy on` says none of the listed proxies can reach chat.z.ai.** The whole list went
+through the probe and not one answered, which on a free list means a bad minute rather than a
+broken install. It is already re-downloaded every few minutes, so the same command usually
+works on the next try; `--country US` and `--mirror raw` change *which* proxies it reads and
+are the next things to reach for. `zeke proxy fetch` shows the list on its own, and
+`zeke proxy list --check` re-probes the entries the pool is drawn from.
 
 **An old build prints nothing at all.** Before the symlink fix, a `zeke` launched through
 `npm link` (which installs a symlink) hit the "am I the program being run?" guard with a *link*
