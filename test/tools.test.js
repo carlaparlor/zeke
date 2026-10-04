@@ -9,7 +9,7 @@ import { editTool } from "../src/tools/edit.js";
 import { globTool, globToRegExp } from "../src/tools/glob.js";
 import { grepTool } from "../src/tools/grep.js";
 import { bashTool, commandSummary } from "../src/tools/bash.js";
-import { todoTool, resetTodos } from "../src/tools/ask.js";
+import { todoTool, resetTodos, getTodoPhases, phasesToMarkdown, markdownToPhases } from "../src/tools/todo.js";
 import { ToolRegistry, createToolRegistry } from "../src/tools/index.js";
 
 describe("text matching", () => {
@@ -449,15 +449,141 @@ function first() {
     assert.deepEqual(commandSummary("git status --short"), { program: "git", args: ["status", "--short"], isGit: true });
   });
 
-  test("todo tracks a list in session state", async () => {
+  test("todo init builds phases and starts the first task", async () => {
     resetTodos();
     const stateful = toolContext(box.cwd, { state: { sessionId: "t1" } });
-    await todoTool.execute({ action: "set", items: ["first", "second"] }, stateful);
-    const done = await todoTool.execute({ action: "done", id: "1" }, stateful);
-    assert.match(done.content, /1\/2 done/);
-    assert.match(done.content, /\[x\] 1\. first/);
-    const missing = await todoTool.execute({ action: "done", id: "99" }, stateful);
-    assert.equal(missing.isError, true);
+    const init = await todoTool.execute(
+      { op: "init", list: [{ phase: "Research", items: ["Read the parser"] }, { phase: "Build", items: ["Write the fix", "Add a test"] }] },
+      stateful,
+    );
+    assert.equal(init.isError, undefined);
+    assert.equal(init.details.op, "init");
+    assert.equal(init.details.storage, "session");
+    assert.deepEqual(
+      init.details.phases.map((p) => [p.name, p.tasks.map((t) => t.status)]),
+      [["Research", ["in_progress"]], ["Build", ["pending", "pending"]]],
+    );
+    assert.match(init.content, /Remaining items \(3\):/);
+    assert.match(init.content, /Active phase 1\/2 "Research" \(0\/1\)/);
+    assert.match(init.content, /- \[ \] Read the parser \(in progress\)/);
+  });
+
+  test("todo done advances the in-progress pointer and reports transitions", async () => {
+    resetTodos();
+    const stateful = toolContext(box.cwd, { state: { sessionId: "t2" } });
+    await todoTool.execute({ op: "init", list: [{ phase: "Work", items: ["one", "two", "three"] }] }, stateful);
+    const done = await todoTool.execute({ op: "done", task: "one" }, stateful);
+    assert.deepEqual(done.details.completedTasks, [{ phase: "Work", content: "one" }]);
+    assert.deepEqual(
+      done.details.phases[0].tasks.map((t) => t.status),
+      ["completed", "in_progress", "pending"],
+    );
+    assert.match(done.content, /Overall: 1\/3 done, 2 open\./);
+    assert.match(done.content, /- \[X\] one/);
+
+    const start = await todoTool.execute({ op: "start", task: "three" }, stateful);
+    assert.deepEqual(
+      start.details.phases[0].tasks.map((t) => t.status),
+      ["completed", "pending", "in_progress"],
+    );
+  });
+
+  test("todo references tasks by content, never ids, and discards failed ops", async () => {
+    resetTodos();
+    const stateful = toolContext(box.cwd, { state: { sessionId: "t3" } });
+    await todoTool.execute({ op: "init", items: ["alpha", "beta"] }, stateful);
+    const byId = await todoTool.execute({ op: "done", task: "task-1" }, stateful);
+    assert.equal(byId.isError, true);
+    assert.match(byId.content, /referenced by content, not by IDs/);
+    assert.equal(getTodoPhases("t3")[0].name, "Tasks");
+    assert.deepEqual(getTodoPhases("t3")[0].tasks.map((t) => t.status), ["in_progress", "pending"]);
+
+    const dup = await todoTool.execute({ op: "append", phase: "Tasks", items: ["gamma", "alpha"] }, stateful);
+    assert.equal(dup.isError, true);
+    assert.match(dup.content, /Task "alpha" already exists/);
+    assert.equal(getTodoPhases("t3")[0].tasks.length, 2, "a failed append lands nothing");
+
+    const empty = await todoTool.execute({ op: "done", task: "nope" }, toolContext(box.cwd, { state: { sessionId: "fresh" } }));
+    assert.match(empty.content, /todo list is empty/);
+  });
+
+  test("todo block/unblock/drop/rm follow omp's transitions", async () => {
+    resetTodos();
+    const stateful = toolContext(box.cwd, { state: { sessionId: "t4" } });
+    await todoTool.execute({ op: "init", list: [{ phase: "P", items: ["a", "b", "c"] }] }, stateful);
+
+    const blocked = await todoTool.execute({ op: "block", task: "a", reason: "waiting on\n  the user" }, stateful);
+    const tasks = blocked.details.phases[0].tasks;
+    assert.equal(tasks[0].status, "blocked");
+    assert.equal(tasks[0].blocker, "waiting on the user");
+    assert.equal(tasks[1].status, "in_progress", "blocking the active task starts the next pending one");
+    assert.match(blocked.content, /1 blocked\./);
+    assert.match(blocked.content, /\(blocked: waiting on the user\)/);
+
+    const noTarget = await todoTool.execute({ op: "block" }, stateful);
+    assert.equal(noTarget.isError, true);
+    assert.match(noTarget.content, /block requires a task or phase target/);
+
+    const unblocked = await todoTool.execute({ op: "unblock", task: "a" }, stateful);
+    assert.equal(unblocked.details.phases[0].tasks[0].status, "pending");
+    assert.equal(unblocked.details.phases[0].tasks[0].blocker, undefined);
+    assert.equal(unblocked.details.phases[0].tasks[1].status, "in_progress", "unblock does not steal the pointer");
+
+    const dropped = await todoTool.execute({ op: "drop", task: "c" }, stateful);
+    assert.equal(dropped.details.phases[0].tasks[2].status, "abandoned");
+    assert.match(dropped.content, /- \[ \] c \(dropped\)/);
+
+    await todoTool.execute({ op: "done", task: "b" }, stateful);
+    const blockDone = await todoTool.execute({ op: "block", phase: "P", reason: "all of it" }, stateful);
+    assert.deepEqual(
+      blockDone.details.phases[0].tasks.map((t) => t.status),
+      ["blocked", "completed", "abandoned"],
+      "block never reopens completed or abandoned tasks",
+    );
+
+    const removed = await todoTool.execute({ op: "rm", task: "b" }, stateful);
+    assert.deepEqual(removed.details.phases[0].tasks.map((t) => t.content), ["a", "c"]);
+    const cleared = await todoTool.execute({ op: "rm" }, stateful);
+    assert.equal(cleared.content, "Todo list cleared.");
+    assert.deepEqual(cleared.details.phases, [{ name: "P", tasks: [] }]);
+  });
+
+  test("todo view is read-only and a missing op is inferred from the shape", async () => {
+    resetTodos();
+    const stateful = toolContext(box.cwd, { state: { sessionId: "t5" } });
+    const viewEmpty = await todoTool.execute({ op: "view" }, stateful);
+    assert.equal(viewEmpty.content, "Todo list is empty.");
+
+    const inferredInit = await todoTool.execute({ list: [{ phase: "X", items: ["x1"] }] }, stateful);
+    assert.equal(inferredInit.details.op, "init");
+    const inferredAppend = await todoTool.execute({ phase: "Y", items: ["y1"] }, stateful);
+    assert.equal(inferredAppend.details.op, "append");
+    assert.equal(inferredAppend.details.phases.length, 2);
+
+    const ambiguous = await todoTool.execute({ task: "x1" }, stateful);
+    assert.equal(ambiguous.isError, true);
+    assert.match(ambiguous.content, /"op" is required/);
+
+    const view = await todoTool.execute({ op: "view" }, stateful);
+    assert.equal(view.details.op, "view");
+    assert.equal(view.details.completedTasks, undefined);
+    assert.match(view.content, /Remaining items \(2\):/);
+  });
+
+  test("todo phases round-trip through markdown", () => {
+    const phases = [
+      { name: "Plan", tasks: [{ content: "scope it", status: "completed" }, { content: "read code", status: "in_progress" }] },
+      { name: "Do", tasks: [{ content: "ship", status: "pending" }, { content: "old idea", status: "abandoned" }, { content: "wait", status: "blocked", blocker: "CI is down" }] },
+    ];
+    const md = phasesToMarkdown(phases);
+    assert.equal(
+      md,
+      ["# Plan", "- [x] scope it", "- [/] read code", "", "# Do", "- [ ] ship", "- [-] old idea", "- [!] wait <!-- blocker: CI is down -->", ""].join("\n"),
+    );
+    const back = markdownToPhases(md);
+    assert.deepEqual(back.errors, []);
+    assert.deepEqual(back.phases, phases);
+    assert.match(markdownToPhases("- [?] huh").errors[0], /unknown status marker/);
   });
 });
 
