@@ -79,8 +79,10 @@ function toolPolicy(tools) {
     lines.push(
       "",
       "# Todos",
-      "- Multi-step work: set a `todo` list with the first real action, and mark items done as you finish them.",
-      "- Never spend a turn only updating todos.",
+      "- Before substantive work (3+ steps, a requested task set, new instructions): `todo` `init` a phased plan covering the whole request — investigation through implementation and verification — with concise, specific 5-10 word task labels. List EVERY user item separately.",
+      "- Tasks are referenced by their verbatim content, never by invented ids. Mark `done` immediately as you finish each one; follow phase order. If you lose the text, `view` — never guess.",
+      "- Waiting on something external: `block` it with a reason and keep going; `unblock` when actionable.",
+      "- Never spend a turn only updating todos: `init` with the first real work, `done`/`start` alongside the next action.",
     );
   }
 

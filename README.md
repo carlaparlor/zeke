@@ -247,7 +247,7 @@ single user message:
 | `glob` | read-only | `glob {"pattern", "path"?}` |
 | `grep` | read-only | `grep {"pattern", "glob"?}` |
 | `bash` | writes, exclusive | `bash {"command", "timeout"?}` — 120 s default; POSIX timeout/interruption kills the command process group; blocks `vim`, `less`, `top`, `ssh`, `sudo` |
-| `todo` | writes | task list the model maintains across turns |
+| `todo` | read-only, exclusive | `todo {"op", "list"?, "task"?, "phase"?, "items"?, "reason"?}` — phased task list, same contract as omp: `init`/`start`/`done`/`drop`/`block`/`unblock`/`append`/`rm`/`view`; tasks addressed by verbatim content; one task `in_progress` at a time; `/todo` shows it |
 | `ask` | writes | asks *you* a question mid-run |
 
 Approvals are policy, not a prompt you have to fight. `auto` (default) approves reads and

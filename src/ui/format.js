@@ -156,7 +156,7 @@ export function summarizeToolCall(toolCall, result) {
       grep: () => `/${args.pattern}/`,
       bash: () => String(args.command ?? ""),
       ask: () => String(args.question ?? ""),
-      todo: () => args.action,
+      todo: () => todoDetail(args),
     }[toolCall?.name] ?? (() => "");
 
   const extra = (() => {
@@ -176,6 +176,15 @@ export function summarizeToolCall(toolCall, result) {
   const raw = String(detail() ?? "").replace(/\s+/g, " ").trim();
   const detailText = raw.length > 100 ? `${raw.slice(0, 97)}…` : raw;
   return { name: String(toolCall?.name ?? "tool"), detail: detailText, extra };
+}
+
+function todoDetail(args) {
+  const op = String(args.op ?? "");
+  if (args.task) return `${op} ${args.task}`;
+  if (args.phase && !Array.isArray(args.items)) return `${op} ${args.phase}`;
+  if (Array.isArray(args.list)) return `${op} (${args.list.length} phase${args.list.length === 1 ? "" : "s"})`;
+  if (Array.isArray(args.items)) return `${op} (${args.items.length})`;
+  return op;
 }
 
 export function formatDuration(ms) {

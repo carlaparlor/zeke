@@ -7,7 +7,8 @@ import { editTool } from "./edit.js";
 import { globTool } from "./glob.js";
 import { grepTool } from "./grep.js";
 import { bashTool } from "./bash.js";
-import { askTool, todoTool } from "./ask.js";
+import { askTool } from "./ask.js";
+import { todoTool } from "./todo.js";
 
 export const builtinTools = [readTool, writeTool, editTool, globTool, grepTool, bashTool, todoTool, askTool];
 
@@ -38,7 +39,23 @@ export { editTool } from "./edit.js";
 export { globTool } from "./glob.js";
 export { grepTool } from "./grep.js";
 export { bashTool, commandSummary } from "./bash.js";
-export { askTool, todoTool, getTodos, resetTodos } from "./ask.js";
+export { askTool } from "./ask.js";
+export {
+  todoTool,
+  getTodoPhases,
+  setTodoPhases,
+  getTodos,
+  resetTodos,
+  applyTodoOp,
+  inferTodoOp,
+  normalizeInProgressTask,
+  nextActionableTask,
+  phasesToMarkdown,
+  markdownToPhases,
+  formatTodoSummary,
+  TODO_OPERATIONS,
+  TODO_STATUSES,
+} from "./todo.js";
 export { ToolError } from "./files.js";
 export { findMatch, diffLines, formatDiff, bigramSimilarity } from "./text.js";
 export { walk } from "./walk.js";

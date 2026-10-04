@@ -20,6 +20,7 @@ import { keeperStatus } from "../bridge/keeper.js";
 import { bridgeCommand } from "./bridge-cli.js";
 import { GLM_MODEL_PRESETS } from "../providers/glm.js";
 import { Events } from "../lib/events.js";
+import { getTodoPhases, phasesToMarkdown } from "../tools/todo.js";
 
 /**
  * @param {{config: any, flags: any, cwd: string, initialPrompt?: string}} options
@@ -241,6 +242,7 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
         ["/verbose [on|off]", "toggle tool output"],
         ["/approvals [ask|auto|yolo]", `approval mode (now: ${runtime.approvalMode})`],
         ["/tools", "list the tools the model can call"],
+        ["/todo", "show the model's current todo list"],
         ["/usage", "context and token usage"],
         ["/compact", "compress older context now"],
         ["/clear", "reset the current conversation, keeping the system prompt"],
@@ -325,6 +327,25 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
         const flags_ = [tool.readOnly ? "read-only" : "writes", tool.exclusive ? "exclusive" : ""].filter(Boolean).join(", ");
         write(`  ${paint.cyan(tool.name.padEnd(10))}${paint.dim(flags_)}`);
         write(`    ${paint.dim(stripAnsi(tool.description).split(". ")[0])}`);
+      }
+      write("");
+    },
+
+    todo: () => {
+      const phases = getTodoPhases(runtime.session?.id ?? "default");
+      const tasks = phases.flatMap((phase) => phase.tasks);
+      if (!tasks.length) {
+        write(paint.dim("no todos yet — the model creates them with the `todo` tool"));
+        return;
+      }
+      const closed = tasks.filter((t) => t.status === "completed" || t.status === "abandoned").length;
+      write(paint.bold(`\nTodos ${paint.dim(`${closed}/${tasks.length} done`)}`));
+      for (const line of phasesToMarkdown(phases).trimEnd().split("\n")) {
+        if (line.startsWith("# ")) write(`  ${paint.cyan(line.slice(2))}`);
+        else if (line.startsWith("- [/]")) write(`  ${paint.yellow(line)}`);
+        else if (line.startsWith("- [x]")) write(`  ${paint.dim(line)}`);
+        else if (line.startsWith("- [!]")) write(`  ${paint.red(line)}`);
+        else if (line) write(`  ${line}`);
       }
       write("");
     },
