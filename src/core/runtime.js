@@ -37,6 +37,13 @@ export class ZekeRuntime {
     this.approvalMode = options.config.approval.mode;
     /** @type {Set<string>} tools the user approved for the whole session */
     this.sessionApproved = new Set();
+    /**
+     * Shell command scopes the user approved with "always" (e.g. `npm test`).
+     * Deliberately separate from the tool-level set: approving one command
+     * must never blanket-approve the `bash` tool.
+     * @type {Set<string>}
+     */
+    this.sessionApprovedCommands = new Set();
     this.#approve = options.approve ?? (async () => ({ approved: true, reason: "no approval handler" }));
     this.#extraTools = options.extraTools ?? [];
     this.#systemPromptOverride = options.systemPrompt;
@@ -135,7 +142,7 @@ export class ZekeRuntime {
     this.#seedSystemPrompt();
     this.turns = 0;
     this.usage = { inputTokens: 0, outputTokens: 0 };
-    this.sessionApproved.clear();
+    this.clearApprovalGrants();
   }
 
   /** Start a distinct conversation, keeping the previous session on disk. */
@@ -152,7 +159,7 @@ export class ZekeRuntime {
     this.#seedSystemPrompt();
     this.turns = 0;
     this.usage = { inputTokens: 0, outputTokens: 0 };
-    this.sessionApproved.clear();
+    this.clearApprovalGrants();
     this.#session = store ?? undefined;
     // The store contains only its metadata record so far; the system prompt is
     // runtime configuration and is never persisted as a transcript message.
@@ -174,7 +181,7 @@ export class ZekeRuntime {
     this.messages = [{ role: "system", content: this.systemPrompt }, ...history];
     this.turns = 0;
     this.usage = { inputTokens: 0, outputTokens: 0 };
-    this.sessionApproved.clear();
+    this.clearApprovalGrants();
     // Everything replayed is already on disk; only new turns get appended.
     this.#persisted = this.messages.length;
     this.events.emit(Events.SESSION_START, { id: store.id, file: store.file, cwd: this.cwd });
@@ -261,12 +268,22 @@ export class ZekeRuntime {
       cwd: this.cwd,
       autoApproveBash: this.config.approval.autoApproveBash,
       sessionApproved: this.sessionApproved,
+      sessionApprovedCommands: this.sessionApprovedCommands,
     });
     if (!decision.required) return { approved: true, reason: decision.reason };
 
-    const answer = await this.#approve(call, tool);
-    if (answer.approved && answer.remember) this.sessionApproved.add(call.name);
+    const answer = await this.#approve(call, tool, { reason: decision.reason, danger: decision.danger });
+    if (answer.approved && answer.remember) {
+      if (answer.scope) this.sessionApprovedCommands.add(answer.scope);
+      else this.sessionApproved.add(call.name);
+    }
     return { approved: answer.approved, reason: answer.reason ?? decision.reason };
+  }
+
+  /** Forget every "always" grant (used when the approval mode changes). */
+  clearApprovalGrants() {
+    this.sessionApproved.clear();
+    this.sessionApprovedCommands.clear();
   }
 
   /**

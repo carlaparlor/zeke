@@ -12,7 +12,7 @@
 
 export { ZekeRuntime, deriveTitle } from "./core/runtime.js";
 export { runAgent, stableStringify } from "./core/agent.js";
-export { evaluateApproval, isReadOnlyCommand, isDangerousCommand } from "./core/approval.js";
+export { evaluateApproval, isReadOnlyCommand, isDangerousCommand, bashCommandScope } from "./core/approval.js";
 export {
   validateArgs,
   applyDefaults,
@@ -56,7 +56,11 @@ export { startBridge, stopBridge, restartBridge, health as bridgeHealth, swapTok
 export { buildBridge, ensureVendored, findGo, sourceFingerprint } from "./bridge/build.js";
 
 export { createRenderer } from "./ui/render.js";
-export { TerminalUI, createTerminalUI } from "./ui/tui.js";
+export { TerminalUI, createTerminalUI, decodeKeys } from "./ui/tui.js";
+export { createApprovalPrompt, describeCall, previewDiff, rememberScope } from "./ui/approve.js";
+export { createTheme, plainTheme, THEME_ROLES } from "./ui/theme.js";
+export { createStreamFormatter, styleLine, inline, summarizeToolCall, formatDuration } from "./ui/format.js";
+export { wrapAnsi, truncateAnsi, fitToWidth, visibleWidth, stripAnsi, colorDepth, spinnerFrames, SPINNER_STYLES } from "./ui/ansi.js";
 export { startMockBridge, scripted } from "./mock-bridge/server.js";
 
 export { VERSION } from "./cli/main.js";

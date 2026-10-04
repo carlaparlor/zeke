@@ -10,6 +10,7 @@ import { ZekeRuntime, deriveTitle } from "../core/runtime.js";
 import { createRenderer } from "../ui/render.js";
 import { createTerminalUI } from "../ui/tui.js";
 import { createApprovalPrompt } from "../ui/approve.js";
+import { createTheme } from "../ui/theme.js";
 import { style, stripAnsi, SYMBOLS, colorEnabled } from "../ui/ansi.js";
 import { displayPath, paths } from "../lib/paths.js";
 import { SessionStore } from "../session/store.js";
@@ -25,10 +26,20 @@ import { Events } from "../lib/events.js";
  * @returns {Promise<number>}
  */
 export async function runInteractive({ config, flags, cwd, initialPrompt }) {
-  const paint = config.ui.color === false ? plain() : style;
+  /** @type {any} */ let rl = null;
+  // One colour decision for the whole interactive surface: the config, the
+  // environment (NO_COLOR, TERM=dumb, FORCE_COLOR) and the TTY are all
+  // consulted once, so the UI and the renderer can never disagree.
+  const wantColor = config.ui.color !== false && colorEnabled(process.stdout);
+  const paint = wantColor ? style : plain();
+  const theme = createTheme({ color: wantColor });
   const terminalUI =
     !flags["no-tui"] && process.stdin.isTTY && process.stdout.isTTY
-      ? createTerminalUI({ color: config.ui.color !== false && colorEnabled(process.stdout) })
+      ? createTerminalUI({
+          color: wantColor,
+          spinner: config.ui.spinner !== false,
+          spinnerStyle: config.ui.spinnerStyle,
+        })
       : null;
   // In TUI mode renderers, approval previews and command output write into the
   // scrollback model. The screen itself is drawn only by TerminalUI.
@@ -41,8 +52,13 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
     systemPrompt: flags["system-prompt"],
     approve: createApprovalPrompt({
       stream: out,
-      color: config.ui.color !== false,
-      ask: terminalUI ? (prompt) => terminalUI.askLine(prompt) : undefined,
+      color: wantColor,
+      theme,
+      choose: terminalUI ? (spec) => terminalUI.choose(spec) : undefined,
+      // Without a full-screen UI there is still exactly one reader on stdin:
+      // the REPL's own readline answers the question (a second interface on
+      // the same stream swallows half of what the user types).
+      ask: terminalUI ? undefined : (prompt) => askOnInterface(rl, prompt),
     }),
   });
 
@@ -95,19 +111,27 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
     terminalUI.attachEvents(runtime.events);
   }
 
-  renderer = createRenderer(runtime.events, {
-    stream: out,
-    color: config.ui.color !== false,
-    verbose,
-    thinking: config.ui.thinking,
-    spinner: terminalUI ? false : config.ui.spinner !== false,
-    columns: () => process.stdout.columns ?? 100,
-  });
+  function makeRenderer() {
+    return createRenderer(runtime.events, {
+      stream: out,
+      color: wantColor,
+      theme,
+      verbose,
+      thinking: config.ui.thinking,
+      // In the TUI the status line animates instead; an inline spinner would
+      // fight it for the same row.
+      spinner: terminalUI ? false : config.ui.spinner !== false,
+      liveActivity: Boolean(terminalUI),
+      columns: () => (terminalUI ? process.stdout.columns ?? 100 : out.columns ?? 100),
+    });
+  }
+
+  renderer = makeRenderer();
 
   // TTY sessions use the full-screen keyboard UI. Piped/scripted sessions keep
   // the line-oriented interface so automation and existing shell workflows
   // remain predictable.
-  const rl = terminalUI ?? createInterface({
+  rl = terminalUI ?? createInterface({
     input: process.stdin,
     output: out,
     terminal: true,
@@ -274,14 +298,7 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
     verbose: (arg) => {
       verbose = arg ? ["on", "true", "1", "yes"].includes(arg.trim().toLowerCase()) : !verbose;
       renderer.dispose();
-      renderer = createRenderer(runtime.events, {
-        stream: out,
-        color: config.ui.color !== false,
-        verbose,
-        thinking: config.ui.thinking,
-        spinner: config.ui.spinner !== false,
-        columns: () => out.columns ?? 100,
-      });
+      renderer = makeRenderer();
       write(`${paint.green(SYMBOLS.check)} verbose ${verbose ? "on" : "off"}`);
     },
 
@@ -297,7 +314,7 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
         return;
       }
       runtime.approvalMode = mode;
-      runtime.sessionApproved.clear();
+      runtime.clearApprovalGrants();
       syncTuiHeader();
       write(`${paint.green(SYMBOLS.check)} approval mode → ${mode}`);
     },
@@ -494,6 +511,15 @@ export async function runInteractive({ config, flags, cwd, initialPrompt }) {
 
   function banner() {
     const model = runtime.config.model;
+    if (terminalUI) {
+      write("");
+      write(
+        `  ${paint.bold("zeke")} ${paint.dim(`v0.1.0 · ${model} · approvals ${runtime.approvalMode}`)}` +
+          (runtime.session ? paint.dim(` · session ${runtime.session.id}`) : ""),
+      );
+      write("");
+      return;
+    }
     write("");
     write(`  ${paint.bold("zeke")} ${paint.dim(`v0.1.0 · ${model} · ${runtime.config.profileName} profile`)}`);
     write(`  ${paint.dim(`${displayPath(cwd)} · ${runtime.tools.names().length} tools · approvals ${runtime.approvalMode}`)}`);
@@ -569,31 +595,43 @@ async function forceCompact(runtime) {
 async function promptUser(question, options, { rl, paint, terminalUI }) {
   if (terminalUI) return terminalUI.ask(question, options);
 
-  rl.pause();
   process.stdout.write(`\n${paint.yellow("?")} ${paint.bold(question)}\n`);
   (options ?? []).forEach((option, i) => {
     process.stdout.write(`  ${paint.cyan(`${i + 1})`)} ${option.label}\n`);
   });
   process.stdout.write(paint.dim(options?.length ? "  number or your own answer\n" : "  your answer\n"));
 
-  const answer = await new Promise((resolve) => {
-    const once = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
-    once.question(`${paint.cyan(">")} `, (value) => {
-      once.close();
-      resolve(value);
-    });
-    once.on("close", () => resolve(""));
-  });
+  const answer = (await askOnInterface(rl, `${paint.cyan(">")} `)) ?? "";
 
   const asNumber = Number(answer.trim());
   if (options && Number.isInteger(asNumber) && asNumber >= 1 && asNumber <= options.length) {
-    rl.resume();
-    rl.prompt();
     return { id: options[asNumber - 1].id };
   }
-  rl.resume();
-  rl.prompt();
   return { id: "custom", custom: answer };
+}
+
+/**
+ * Ask one question on an existing readline interface.
+ *
+ * A second `createInterface` over the same stdin looks harmless and is not:
+ * both readers consume the stream, so a typed answer is split between them and
+ * the user sees their keystrokes appear in the wrong place. Resuming a paused
+ * interface for the length of the question keeps exactly one reader.
+ *
+ * @param {import("node:readline").Interface} rl
+ * @returns {Promise<string|null>} null when the stream closes (EOF)
+ */
+export function askOnInterface(rl, prompt) {
+  return new Promise((resolve) => {
+    const onClose = () => resolve(null);
+    rl.once("close", onClose);
+    rl.resume();
+    rl.question(prompt, (answer) => {
+      rl.removeListener("close", onClose);
+      rl.pause();
+      resolve(answer);
+    });
+  });
 }
 
 function progressBar(percent, width) {
